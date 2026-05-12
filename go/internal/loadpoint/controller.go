@@ -124,6 +124,16 @@ type Controller struct {
 	// the feature entirely — the LP behaves exactly as today.
 	batSoC func() (float64, bool)
 
+	// gridDeferredMu protects gridDeferred. The map is set by main.go's
+	// MPC spec builder when it decides to suppress grid-funded EV
+	// planning (because the deadline lies past the last published price
+	// slot). Runtime dispatch reads it to ALSO enforce surplus-only
+	// behaviour at the tick — so when forecast PV undershoots reality
+	// the EV pauses rather than silently importing from grid against a
+	// plan budget that assumed sun.
+	gridDeferredMu sync.Mutex
+	gridDeferred   map[string]bool
+
 	// batSoCArmed tracks the per-LP arm/release state for the bat-SoC
 	// hysteresis. batSoCNoPV counts consecutive ticks where the live
 	// site surplus dropped to zero — a sustained no-PV run releases
@@ -413,25 +423,67 @@ func (c *Controller) evalBatSoCArm(lpID string, threshold float64) bool {
 	return armed
 }
 
+// SetGridDeferred records that MPC has suppressed grid-funded EV
+// planning for this LP (because the deadline lies past published
+// prices). Surplus dispatch semantics apply at runtime too: the EV's
+// commanded W is snapped to live surplus only, with no grid import,
+// regardless of what the cached MPC plan budget says. Cleared when
+// MPC's next replan finds prices for the deadline window. Safe to
+// call concurrently with the dispatch tick.
+func (c *Controller) SetGridDeferred(lpID string, deferred bool) {
+	if c == nil {
+		return
+	}
+	c.gridDeferredMu.Lock()
+	defer c.gridDeferredMu.Unlock()
+	if c.gridDeferred == nil {
+		c.gridDeferred = map[string]bool{}
+	}
+	if deferred {
+		c.gridDeferred[lpID] = true
+	} else {
+		delete(c.gridDeferred, lpID)
+	}
+}
+
+// gridDeferredFor reads the per-LP deferral flag set by main.go's MPC
+// spec builder. Read-only accessor used inside surplusActive.
+func (c *Controller) gridDeferredFor(lpID string) bool {
+	if c == nil {
+		return false
+	}
+	c.gridDeferredMu.Lock()
+	defer c.gridDeferredMu.Unlock()
+	return c.gridDeferred[lpID]
+}
+
 // surplusActive reports whether surplus-only dispatch semantics apply
-// to this loadpoint right now. True when the configured SurplusOnly
-// flag is on, OR when the bat-SoC unlock is armed for this LP. The
-// caller passes the loadpoint's schedule so we read the threshold
+// to this loadpoint right now. True when ANY of:
+//   - the operator's configured SurplusOnly flag is on
+//   - MPC has deferred grid-funded planning (forecast-vs-real divergence
+//     guard: even if the cached plan said "charge 2 kW now", live PV
+//     might have collapsed since the last replan)
+//   - the bat-SoC unlock is armed for this LP
+//
+// The caller passes the loadpoint's schedule so we read the threshold
 // without re-locking the Manager.
 func (c *Controller) surplusActive(lpCfg Config, sched Schedule) bool {
 	if lpCfg.SurplusOnly {
+		return true
+	}
+	if c.gridDeferredFor(lpCfg.ID) {
 		return true
 	}
 	return c.evalBatSoCArm(lpCfg.ID, sched.SurplusUnlockBatSoCPct)
 }
 
 // AnyLoadpointSurplusActive reports whether any configured loadpoint
-// is currently treating PV surplus as priority — either via the
-// configured SurplusOnly flag or via a runtime-armed bat-SoC unlock.
-// main.go's siteSurplusForEVW reader uses this to zero out the
-// home-battery's PV-charge contribution from the EV's apparent
-// surplus, which prevents the EV from stealing PV that the planner
-// already routed to the home battery (the flap-avoidance rule).
+// is currently treating PV surplus as priority — via the configured
+// SurplusOnly flag, the MPC grid-deferral flag, or a runtime-armed
+// bat-SoC unlock. main.go's siteSurplusForEVW reader uses this to
+// zero out the home-battery's PV-charge contribution from the EV's
+// apparent surplus, which prevents the EV from stealing PV that the
+// planner already routed to the home battery (the flap-avoidance rule).
 //
 // Safe to call before Tick has ever run — returns false in that case.
 func (c *Controller) AnyLoadpointSurplusActive() bool {
@@ -440,6 +492,9 @@ func (c *Controller) AnyLoadpointSurplusActive() bool {
 	}
 	for _, cfg := range c.manager.Configs() {
 		if cfg.SurplusOnly {
+			return true
+		}
+		if c.gridDeferredFor(cfg.ID) {
 			return true
 		}
 		sched, _ := c.manager.GetSchedule(cfg.ID)

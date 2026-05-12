@@ -656,6 +656,12 @@ func main() {
 	defer loadSvc.Stop()
 	slog.Info("loadmodel started", "peak_w", loadPeakW, "quality", loadSvc.Model().Quality())
 
+	// Forward-declared so the MPC spec builder closure (set below) can
+	// push grid-deferred state into the runtime controller. The
+	// controller itself is constructed further down once its
+	// dependencies (planAdapter, telAdapter, registry) are wired.
+	var lpController *loadpoint.Controller
+
 	// ---- Start MPC planner (optional) ----
 	mpcSvc = buildMPC(cfg, st, tel, capacities)
 	if mpcSvc != nil {
@@ -788,6 +794,15 @@ func main() {
 				if deferGridPlan {
 					slog.Info("mpc: LP grid-funded planning deferred — target past published prices",
 						"lp", st.ID, "target", st.TargetTime, "hours_to_target", time.Until(st.TargetTime).Hours())
+				}
+				// Mirror the deferral into the runtime controller so live
+				// dispatch enforces "no grid import" too. Without this,
+				// MPC's plan would still record a small EV budget per slot
+				// (snapped to forecast surplus); when forecast PV
+				// undershoots reality, the runtime controller would
+				// happily import grid to fulfil the cached plan budget.
+				if lpController != nil {
+					lpController.SetGridDeferred(st.ID, deferGridPlan)
 				}
 				return &mpc.LoadpointSpec{
 					ID:              st.ID,
@@ -922,7 +937,8 @@ func main() {
 	//
 	// Adapters here keep loadpoint independent of mpc/telemetry
 	// (mpc already imports loadpoint — the cycle must go this way).
-	var lpController *loadpoint.Controller
+	// lpController is forward-declared earlier so the MPC spec builder
+	// closure can push grid-deferred state into it.
 	if mpcSvc != nil {
 		planAdapter := func(now time.Time) (loadpoint.Directive, bool) {
 			d, ok := mpcSvc.SlotDirectiveAt(now)
