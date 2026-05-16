@@ -2218,6 +2218,23 @@ func (s *Server) handleLoadpointTarget(w http.ResponseWriter, r *http.Request) {
 			surplusDisabled = true
 		}
 	}
+	// Force-wake the bound vehicle on any schedule edit. Without this
+	// the next plan + dispatch tick reads stale vehicle state — the
+	// new schedule could be planning against an old SoC, old vehicle
+	// charge_limit, or a "Complete" status that no longer reflects
+	// reality. Fire-and-forget on a background goroutine so the API
+	// stays snappy even when the BLE proxy is slow / asleep. Bounded
+	// timeout so a hung wake never leaks. Bypasses the auto-wake
+	// cooldown — the operator just told us they want a fresh read.
+	if scheduleChanged && s.deps.LoadpointCtrl != nil {
+		go func(lpID string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := s.deps.LoadpointCtrl.RefreshVehicle(ctx, lpID); err != nil {
+				slog.Warn("loadpoint refresh-vehicle failed", "lp", lpID, "err", err)
+			}
+		}(id)
+	}
 	if s.deps.MPC != nil {
 		if surplusDisabled {
 			slog.Info("loadpoint surplus_only disabled — forcing replan",

@@ -510,6 +510,70 @@ func (c *Controller) AnyLoadpointSurplusActive() bool {
 	return false
 }
 
+// RefreshVehicle sends a one-off wake command to the vehicle driver
+// bound to the given loadpoint, bypassing the auto-wake cooldown.
+// Used by the API when the operator edits the schedule — wakes Tesla
+// (or whichever vehicle driver is bound) so the next poll surfaces
+// any vehicle-side limit / SoC / connection changes immediately
+// rather than waiting up to the next natural wake window.
+//
+// The wake action is the same `charge_start` the auto-wake loop uses;
+// Tesla treats it as "wake + (idempotently) start charging if not
+// already at limit", and the driver's normal poll cycle picks up the
+// fresh state. Returns nil if no vehicle driver is bound or the
+// controller isn't fully wired (no-op). Errors from the send hop are
+// returned for the caller to surface to the operator.
+func (c *Controller) RefreshVehicle(ctx context.Context, lpID string) error {
+	if c == nil || c.vehicleStatus == nil || c.send == nil {
+		return nil
+	}
+	driver, _, ok := c.vehicleStatus(lpID)
+	if !ok || driver == "" {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]any{"action": "charge_start"})
+	if err != nil {
+		return err
+	}
+	// Reset the auto-wake throttle so a manual refresh doesn't leave
+	// the LP in a long backoff afterwards — the operator just told us
+	// they want a fresh read, no reason to apply 90s cooldown to the
+	// next legitimate auto-wake.
+	c.wakeMu.Lock()
+	if c.wakeLast == nil {
+		c.wakeLast = map[string]time.Time{}
+		c.wakeKickUntil = map[string]time.Time{}
+		c.wakeAttempts = map[string]int{}
+	}
+	delete(c.wakeAttempts, lpID)
+	c.wakeLast[lpID] = time.Now()
+	c.wakeMu.Unlock()
+	slog.Info("loadpoint manual wake (schedule edit)", "lp", lpID, "vehicle_driver", driver)
+	return c.send(ctx, driver, payload)
+}
+
+// IsBatSoCArmed reports whether the bat-SoC surplus unlock is
+// currently armed for the given loadpoint. Surfaced so main.go can
+// thread this runtime state into the MPC LoadpointSpec.SurplusOnly
+// — without it, MPC plans battery→EV transfers freely while the
+// dispatch layer's bat-SoC arming refuses to execute them, producing
+// misleading "battery discharges to feed EV" entries in the plan UI
+// that never actually happen.
+//
+// Returns false if the controller is nil, no arm map yet exists, or
+// the LP id isn't tracked. Safe to call concurrently with Tick.
+func (c *Controller) IsBatSoCArmed(lpID string) bool {
+	if c == nil {
+		return false
+	}
+	c.batSoCArmedMu.Lock()
+	defer c.batSoCArmedMu.Unlock()
+	if c.batSoCArmed == nil {
+		return false
+	}
+	return c.batSoCArmed[lpID]
+}
+
 // SetSiteFuse installs the grid-boundary fuse so the controller can
 // pass voltage + per-phase amperage to drivers in every command.
 // Called once at startup from main.go after config load. A zero-value

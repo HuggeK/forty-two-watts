@@ -820,23 +820,37 @@ func main() {
 				if lpController != nil {
 					lpController.SetGridDeferred(st.ID, deferGridPlan)
 				}
+				// Surplus-only sources, in order of precedence:
+				//   1. Operator's explicit surplus_only flag on the LP
+				//   2. MPC grid-funded planning deferral (target past
+				//      published prices)
+				//   3. Runtime bat-SoC unlock arming — when the home
+				//      battery is at/above the schedule's threshold AND
+				//      live PV surplus is available, the dispatch layer
+				//      already treats the LP as surplus-only. Without
+				//      threading it into the MPC spec here, the plan
+				//      would prescribe battery→EV transfers that
+				//      dispatch then has to censor — producing
+				//      misleading slot entries the operator sees in
+				//      /api/mpc/plan that never actually execute.
+				batSoCArmed := false
+				if lpController != nil {
+					batSoCArmed = lpController.IsBatSoCArmed(st.ID)
+				}
 				return &mpc.LoadpointSpec{
-					ID:              st.ID,
-					CapacityWh:      capWh,
-					Levels:          11,
-					MinPct:          0,
-					MaxPct:          maxPct,
-					InitialSoCPct:   initSoC,
-					PluggedIn:       true,
-					TargetSoCPct:    targetPct,
-					TargetSlotIdx:   targetSlot,
-					MaxChargeW:      st.MaxChargeW,
-					AllowedStepsW:   st.AllowedStepsW,
+					ID:               st.ID,
+					CapacityWh:       capWh,
+					Levels:           11,
+					MinPct:           0,
+					MaxPct:           maxPct,
+					InitialSoCPct:    initSoC,
+					PluggedIn:        true,
+					TargetSoCPct:     targetPct,
+					TargetSlotIdx:    targetSlot,
+					MaxChargeW:       st.MaxChargeW,
+					AllowedStepsW:    st.AllowedStepsW,
 					ChargeEfficiency: 0.9,
-					// Either operator-configured surplus_only OR our
-					// "wait for tomorrow's prices" defer triggers MPC's
-					// no-grid constraint for this LP.
-					SurplusOnly: st.SurplusOnly || deferGridPlan,
+					SurplusOnly:      st.SurplusOnly || deferGridPlan || batSoCArmed,
 				}
 			}
 			return nil
