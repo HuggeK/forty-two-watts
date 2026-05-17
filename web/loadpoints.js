@@ -83,9 +83,23 @@
     const vehicle = (lp.vehicle_driver)
       ? `${lp.vehicle_driver}${lp.vehicle_charging_state ? ' · ' + lp.vehicle_charging_state : ''}${lp.vehicle_stale ? ' · stale' : ''}`
       : '—';
-    const soc = (lp.current_soc_pct != null)
-      ? `${lp.current_soc_pct.toFixed(1)}%${lp.soc_source ? ' (' + lp.soc_source + ')' : ''}`
-      : '—';
+    // When soc_source is "vehicle", the BMS reading (vehicle_soc_pct)
+    // is ground truth and what the operator expects to see — render
+    // that. current_soc_pct stays as the controller's inference state
+    // (the planner's input for stability across ticks) and is shown
+    // in parens as "(inferred: 65.1%)" so the discrepancy is visible
+    // when it exists. When soc_source is "inferred" the inference
+    // value is the only one we have, so display it directly.
+    let soc = '—';
+    if (lp.soc_source === 'vehicle' && lp.vehicle_soc_pct != null) {
+      soc = `${lp.vehicle_soc_pct.toFixed(0)}% (vehicle)`;
+      if (lp.current_soc_pct != null &&
+          Math.abs(lp.vehicle_soc_pct - lp.current_soc_pct) >= 1) {
+        soc += ` · inferred ${lp.current_soc_pct.toFixed(1)}%`;
+      }
+    } else if (lp.current_soc_pct != null) {
+      soc = `${lp.current_soc_pct.toFixed(1)}%${lp.soc_source ? ' (' + lp.soc_source + ')' : ''}`;
+    }
     const rows = [
       ['Driver',       lp.driver_name || '—'],
       ['Plugged in',   badge(lp.plugged_in ? 'YES' : 'NO', lp.plugged_in)],
