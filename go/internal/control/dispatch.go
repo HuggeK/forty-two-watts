@@ -78,6 +78,17 @@ type SlotDirectiveFunc func(now time.Time) (SlotDirective, bool)
 // `max_discharge_w` (see PowerLimits + State.DriverLimits, issue #145).
 const MaxCommandW = 5000
 
+// evActiveThresholdW is the floor below which state.EVChargingW is
+// treated as driver-side noise (a connected-but-idle wallbox bleeds a
+// few watts of last-known smoothed reading after the contactor
+// opens). Above the threshold, the BatteryCoversEV=false safety net
+// caps battery discharge to the house side so the planner doesn't
+// drain the battery into the EV. Below it, the EV is effectively
+// idle and the safety net stays off, letting the planner's evening-
+// peak export plan run unmolested. 100 W matches the deadband used
+// elsewhere in this package for sign decisions.
+const evActiveThresholdW = 100.0
+
 // PowerLimits holds the per-driver charge/discharge ceiling. Zero on
 // either field means "use the global MaxCommandW default" — the value
 // an unset config key carries through the YAML → Driver struct →
@@ -231,6 +242,30 @@ type State struct {
 	// the new energy-allocation path. False until validated in production
 	// and flipped via config. Default off preserves today's behavior.
 	UseEnergyDispatch bool
+
+	// PVSurplusAbsorbSoCCapPct is the opt-in PV-surplus absorber
+	// underlay: in planner_cheap / planner_arbitrage, when live grid is
+	// exporting more than PVSurplusAbsorbThresholdW BEYOND what the
+	// planner's slot allocation would produce, AND the fleet's average
+	// SoC is below this cap, the energy-path's targetTotalW is bumped
+	// up by min(extra_export, cap_headroom_W) so the surprise lands in
+	// the battery instead of crossing the meter at low spot price.
+	//
+	// 0 = disabled (default — preserves the pre-2026-05 behavior
+	// asserted by TestEnergyDispatchDoesNotAbsorbPVSurprise). >0 turns
+	// the feature on with that percentage as the SoC ceiling.
+	//
+	// Never reverses a discharge plan: when the planner has already
+	// committed to discharge this slot (targetTotalW < 0, e.g.
+	// evening-peak export), the absorber stays passive.
+	PVSurplusAbsorbSoCCapPct float64
+
+	// PVSurplusAbsorbThresholdW is the dead-band on the absorber: how
+	// much live export beyond plan we tolerate before charging the
+	// battery instead. Defaults to 100 W (smaller than the PI
+	// deadband, but large enough to ignore meter quantisation noise).
+	// Only consulted when PVSurplusAbsorbSoCCapPct > 0.
+	PVSurplusAbsorbThresholdW float64
 
 	// currentDirective + slotDelivered track the active slot's energy
 	// accounting. Reset when the slot rolls over (by SlotStart equality).
@@ -775,20 +810,92 @@ func ComputeDispatch(
 		// commanded discharge to the level the reactive path would target
 		// — i.e. enough to zero the *house* side, not to feed the EV.
 		// Charging is left untouched. Mirrors the dispatch.go:453 rule on
-		// the legacy path. The MPC also gets a NoBatteryToEV constraint
-		// so the plan stops prescribing what dispatch then has to censor.
+		// the legacy path.
+		//
+		// Use a real EV-active threshold (evActiveThresholdW) instead of
+		// `> 0`: connected-but-idle chargers report low-W noise (~1 W
+		// from Easee's last-known reading bleed) that would otherwise
+		// trip this safety net on every evening-peak slot — pinning a
+		// planned -9 kW discharge to just-cover-the-house. The threshold
+		// preserves the EV-protection guarantee for any real draw while
+		// letting noise pass through. Regression:
+		// TestEnergyDispatchIgnoresEVChargingWNoiseUnderThreshold,
+		// TestEnergyDispatchClampsDischargeWhenEVActuallyCharging.
+		//
 		// EXCEPTION: surplus-only transient cover. Same gate as the
 		// rawGridW-subtraction path above — when a surplus_only LP is
 		// drawing more than current surplus (site importing), the battery
 		// is allowed to bridge the EV ramp-down for ~10 s while the
 		// Easee/car-side current ramp completes. The cap reverts the
 		// moment grid goes negative.
-		surplusTransient := state.EVSurplusOnlyReserveW > 0 && state.EVChargingW > 0 && rawGridW > 0
-		if !state.BatteryCoversEV && !surplusTransient && state.EVChargingW > 0 && targetTotalW < 0 {
+		evActive := state.EVChargingW > evActiveThresholdW
+		surplusTransient := state.EVSurplusOnlyReserveW > 0 && evActive && rawGridW > 0
+		// CANONICAL "battery may not feed EV" accounting. The MPC's
+		// NoBatteryToEV DP feasibility rule (mpc.go, see the
+		// houseResidualW check inside the action loop) mirrors this
+		// computation so the planner stops emitting allocations that
+		// this clamp then has to censor. TODO(refactor): extract the
+		// houseResidualW math + the (battW<0, evW>0) feasibility
+		// predicate into a small helper consumed by both this clamp
+		// and the DP rule, so a future change to the accounting can't
+		// drift between plan and runtime.
+		if !state.BatteryCoversEV && !surplusTransient && evActive && targetTotalW < 0 {
 			houseGridW := rawGridW - state.EVChargingW
 			reactiveTotal := currentTotal - houseGridW
 			if targetTotalW < reactiveTotal {
 				targetTotalW = reactiveTotal
+			}
+		}
+
+		// PV surplus absorber underlay (opt-in). Catches the gap between
+		// the MPC's 15-min slot allocation and live PV/load drift: when
+		// the plan's target would still leave grid exporting beyond the
+		// threshold AND average SoC is below cap AND we're not already
+		// in a planned discharge, redirect the leftover export into the
+		// battery instead of crossing the meter at low spot price.
+		//
+		// Only adds charge — never reverses a discharge plan. The slot
+		// Wh accumulator (state.slotDelivered) sees the extra and the
+		// next replan reads true SoC, so the plan adapts naturally.
+		//
+		// Order: runs BEFORE the surplus-only EV reserve cap below, so
+		// any addition the absorber makes is then re-capped if an EV is
+		// reserving PV headroom for itself.
+		if state.PVSurplusAbsorbSoCCapPct > 0 && targetTotalW >= 0 {
+			threshold := state.PVSurplusAbsorbThresholdW
+			if threshold <= 0 {
+				threshold = 100
+			}
+			var sumSoCWh, totalCap float64
+			for _, b := range onlineBats {
+				sumSoCWh += b.soc * b.capacityWh
+				totalCap += b.capacityWh
+			}
+			var avgSoCPct float64
+			if totalCap > 0 {
+				avgSoCPct = (sumSoCWh / totalCap) * 100
+			}
+			if avgSoCPct < state.PVSurplusAbsorbSoCCapPct {
+				// Grid level if dispatch ran the plan as-is.
+				projectedGridW := rawGridW + (targetTotalW - currentTotal)
+				extraExportW := -projectedGridW
+				if extraExportW > threshold {
+					// Remaining headroom in Wh, converted to a power
+					// share over the rest of the slot. Floor remainingS
+					// at 60 s so the late-slot edge doesn't ask for
+					// implausibly high power.
+					socHeadroomWh := (state.PVSurplusAbsorbSoCCapPct - avgSoCPct) / 100 * totalCap
+					remainS := remainingS
+					if remainS < 60 {
+						remainS = 60
+					}
+					headroomW := socHeadroomWh * 3600 / remainS
+					addW := extraExportW
+					if addW > headroomW {
+						addW = headroomW
+					}
+					targetTotalW += addW
+				}
 			}
 		}
 
@@ -799,7 +906,8 @@ func ComputeDispatch(
 		// drift, stale plan fallback, and the period before the next
 		// replan picks up the EV's needs). Discharge is unaffected — the
 		// reserve only matters when the battery is competing with the
-		// EV for the same surplus PV.
+		// EV for the same surplus PV. Final cap — runs AFTER the PV
+		// surplus absorber so the absorber can't override an EV reserve.
 		if state.EVSurplusOnlyReserveW > 0 && targetTotalW > 0 {
 			pvSurplus := -gridW + currentTotal
 			reserveRemaining := state.EVSurplusOnlyReserveW - state.EVChargingW

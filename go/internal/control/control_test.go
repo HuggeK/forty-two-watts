@@ -2367,3 +2367,318 @@ func TestMeterClampRespectsNonZeroGridTarget(t *testing.T) {
 		t.Errorf("clamp let discharge overshoot GridTargetW, got sum=%f", sum)
 	}
 }
+
+// ---- PV surplus absorber underlay ----
+//
+// Opt-in policy reversal of TestEnergyDispatchDoesNotAbsorbPVSurprise: when
+// the operator sets a SoC cap (PVSurplusAbsorbSoCCapPct > 0), the dispatch
+// catches the gap between the planner's 15-min slot allocation and the
+// live PV/load drift — additional export beyond plan flows into the
+// battery instead of out the meter at low spot price. Only kicks in
+// planner_cheap / planner_arbitrage (the modes whose energy path doesn't
+// react to live grid), only adds charge (never reverses a discharge plan),
+// only while SoC < cap. Otherwise the original "let it export" behavior
+// stands. See the operator-report cycle 2026-04-17 → 2026-05-15.
+
+// Same scenario as TestEnergyDispatchDoesNotAbsorbPVSurprise, but with the
+// absorber knob enabled and SoC below cap → battery absorbs the surprise.
+func TestPVSurplusAbsorberAbsorbsExtraExportWhenEnabled(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 200, // plan: charge 200 Wh (~ 800 W)
+		Strategy:        "arbitrage",
+	}
+	// Grid exporting 4 kW (PV surprise — PV 4.8 kW, load 0.8 kW, battery 0).
+	store := seedStore(-4000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5}, // SoC 50%, well below 88% cap
+	})
+	store.Update("pv-1", telemetry.DerPV, -4800, nil, nil)
+	store.DriverHealthMut("pv-1").RecordSuccess()
+
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.PVSurplusAbsorbSoCCapPct = 88 // enable
+	st.PVSurplusAbsorbThresholdW = 100
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if len(targets) != 1 {
+		t.Fatalf("want 1 target, got %d", len(targets))
+	}
+	// Energy balance: grid = load + pv + battery, so -4000 = 800 + (-4800) + 0
+	// ⇒ load is 800 W, PV surplus over load is 4000 W. Plan wanted +800 W.
+	// Plan-as-is would leave -3200 W still exporting (rawGridW + planTarget).
+	// Absorber catches the 3200 W leftover and stacks on top of plan →
+	// target ≈ 800 + 3200 = 4000 W, projected grid → 0.
+	// Allow ±400 W slack for energy-formula time drift and threshold.
+	got := targets[0].TargetW
+	if got < 3600 {
+		t.Errorf("TargetW = %.0f W — absorber should be soaking PV surplus into battery (want ≈ 4000 W)", got)
+	}
+	if got > 4400 {
+		t.Errorf("TargetW = %.0f W — absorber overshoot (want ≈ 4000 W, fuse/cap should bound)", got)
+	}
+}
+
+// Defaults preserve back-compat: PVSurplusAbsorbSoCCapPct = 0 means
+// disabled; original "don't absorb surprise" behavior holds.
+func TestPVSurplusAbsorberDisabledByDefault(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 200,
+		Strategy:        "arbitrage",
+	}
+	store := seedStore(-4000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	store.Update("pv-1", telemetry.DerPV, -4800, nil, nil)
+	store.DriverHealthMut("pv-1").RecordSuccess()
+
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	// No PVSurplusAbsorbSoCCapPct set → defaults to 0 → feature off.
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	got := targets[0].TargetW
+	// Same expectations as TestEnergyDispatchDoesNotAbsorbPVSurprise.
+	if got > 1500 {
+		t.Errorf("TargetW = %.0f W — absorber should be off by default; got runaway absorption", got)
+	}
+	if got < 100 {
+		t.Errorf("TargetW = %.0f W — plan intent (~800 W) should still run", got)
+	}
+}
+
+// At-cap: absorber must not push SoC above cap.
+func TestPVSurplusAbsorberHoldsAtCap(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 200,
+		Strategy:        "arbitrage",
+	}
+	store := seedStore(-4000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.88}, // already at cap
+	})
+	store.Update("pv-1", telemetry.DerPV, -4800, nil, nil)
+	store.DriverHealthMut("pv-1").RecordSuccess()
+
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.PVSurplusAbsorbSoCCapPct = 88
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	got := targets[0].TargetW
+	// SoC already at cap → no absorption beyond the plan's ~800 W intent.
+	if got > 1500 {
+		t.Errorf("TargetW = %.0f W — at cap, absorber should defer to plan (~800 W)", got)
+	}
+}
+
+// BatteryCoversEV=false must NOT clamp a planned evening-peak discharge
+// when the EV is effectively idle (driver reporting <100 W of noise).
+// Pre-fix, EVChargingW > 0 was the gate and any tiny non-zero from
+// Easee (~1 W on a connected-but-idle cable) tripped the cap, leaving
+// the planner's -9000 W export pinned to "just enough to zero the
+// house" (~-1 kW on a typical evening). Regression: live state showed
+// plan=-9000 W → realised ≈-1.3 kW with ev_w=0, ev_charging_w=1.08.
+func TestEnergyDispatchIgnoresEVChargingWNoiseUnderThreshold(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: -2250, // plan: -9 kW for the slot
+		Strategy:        "arbitrage",
+	}
+	// Evening: PV gone, house ~1.4 kW load, plan wants to export
+	// hard. Battery currently at 0; rawGridW reflects the no-battery
+	// case (house importing 1.4 kW).
+	store := seedStore(1400, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.85},
+	})
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.BatteryCoversEV = false
+	st.EVChargingW = 1.08 // <-- driver noise; EV is plugged-idle, not drawing
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if len(targets) != 1 {
+		t.Fatalf("want 1 target, got %d", len(targets))
+	}
+	got := targets[0].TargetW
+	// With the noise threshold in place, the safety net stays off and
+	// the planner's -9 kW discharge runs. Allow generous slack — slew,
+	// fuse and per-driver clamps may still trim it, but it should be
+	// well below -3 kW (i.e. discharging hard, not just covering house).
+	if got > -3000 {
+		t.Errorf("TargetW = %.0f W — EVChargingW noise (1 W) clamped a -9 kW plan to house-only. Want ≤ -3000 W.", got)
+	}
+}
+
+// Counter-check: when the EV is genuinely drawing (>= threshold), the
+// safety net MUST still fire to prevent the planner's discharge from
+// feeding the EV via the battery. battery_covers_ev=false is a strong
+// promise; the noise threshold doesn't weaken it for real draws.
+func TestEnergyDispatchClampsDischargeWhenEVActuallyCharging(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: -2250,
+		Strategy:        "arbitrage",
+	}
+	// House 1.4 kW load + EV drawing 4 kW = rawGridW 5.4 kW import.
+	store := seedStore(5400, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.85},
+	})
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.BatteryCoversEV = false
+	st.EVChargingW = 4000 // real charging — safety net MUST fire
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	got := targets[0].TargetW
+	// Battery should cover ~the house (~-1.4 kW), NOT the EV.
+	if got < -2500 {
+		t.Errorf("TargetW = %.0f W — safety net failed: battery is feeding the EV (want ≈ -1.4 kW).", got)
+	}
+	if got > -500 {
+		t.Errorf("TargetW = %.0f W — house side not covered (want roughly -1.4 kW).", got)
+	}
+}
+
+// Don't reverse a discharge plan: if the planner is deliberately
+// discharging this slot (e.g. evening-peak export), the absorber stays
+// out of the way regardless of live grid sign.
+// Regression for the operator-reported "battery sits idle while
+// surplus exports under EV reserve". Energy path, plan dictates
+// charge battery, EV is on surplus_only at 2.5 kW with 11 kW max,
+// and 3 kW is currently exporting at the real meter.
+//
+// dispatch.go:685 subtracts EVChargingW from gridW before the home-
+// battery decision so the battery sees "what export would exist
+// without the EV", which is 3000 + 2500 = 5500 W in this scenario.
+// The reserve cap then carves out reserveRemaining for the EV to
+// step up into.
+//
+// Pre-fix (reserve = full MaxChargeW = 11000): reserveRemaining
+// = 11000 - 2500 = 8500. ceiling = 5500 - 8500 = -3000 → 0. Battery
+// idles; surplus dumps to grid.
+//
+// Post-fix (reserve = CurrentPowerW + EVRampHeadroomW = 4500):
+// reserveRemaining = 4500 - 2500 = 2000. ceiling = 5500 - 2000 =
+// 3500. Battery picks up the bulk of the surplus while leaving 2 kW
+// of headroom for the EV to ramp up.
+//
+// The test sets EVSurplusOnlyReserveW directly to the value
+// loadpoint.SurplusReserveW would produce; the helper itself is
+// unit-tested separately in internal/loadpoint.
+func TestEnergyDispatchAbsorbsSurplusBeyondEVReserveActualDraw(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 1250, // plan: charge ~5 kW over the slot
+		Strategy:        "arbitrage",
+	}
+	store := seedStore(-3000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	store.Update("pv-1", telemetry.DerPV, -6000, nil, nil)
+	store.DriverHealthMut("pv-1").RecordSuccess()
+
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.EVChargingW = 2500
+	st.EVSurplusOnlyReserveW = 2500 + 2000 // = SurplusReserveW for one LP at 2.5 kW
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if len(targets) != 1 {
+		t.Fatalf("want 1 target, got %d", len(targets))
+	}
+	got := targets[0].TargetW
+	// Want ≈ 3500 W. Allow ±400 W slack for time drift / formula edge.
+	if got < 3100 {
+		t.Errorf("TargetW = %.0f W — battery should absorb the surplus that the EV's adaptive reserve no longer hoards (want ≈ 3500 W, was 0 pre-fix)", got)
+	}
+	if got > 3900 {
+		t.Errorf("TargetW = %.0f W — battery overshoot, must leave EVRampHeadroomW (2 kW) of headroom for EV ramp-up (want ≈ 3500 W)", got)
+	}
+}
+
+// Companion: same setup, but with the PRE-FIX reserve (= full
+// MaxChargeW). The battery should be capped at or near 0. Documents
+// the bug this PR fixed and prevents accidental re-regression if
+// someone later restores the old reserve formula.
+func TestEnergyDispatchPreFixReserveStarvesBattery(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 1250,
+		Strategy:        "arbitrage",
+	}
+	store := seedStore(-3000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	store.Update("pv-1", telemetry.DerPV, -6000, nil, nil)
+	store.DriverHealthMut("pv-1").RecordSuccess()
+
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.EVChargingW = 2500
+	st.EVSurplusOnlyReserveW = 11000 // simulate the old "reserve = MaxChargeW" formula
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	got := targets[0].TargetW
+	if got > 200 {
+		t.Errorf("TargetW = %.0f W — full-MaxChargeW reserve should starve the battery here; if you see a non-trivial target the dispatch reserve cap regressed", got)
+	}
+}
+
+func TestPVSurplusAbsorberDoesNotReverseDischarge(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: -1000, // plan: discharge ~4 kW
+		Strategy:        "arbitrage",
+	}
+	// Grid exporting hard (PV plus planned discharge), but plan is
+	// intentionally export-at-peak. Absorber must NOT flip the sign.
+	store := seedStore(-4000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	store.Update("pv-1", telemetry.DerPV, -4800, nil, nil)
+	store.DriverHealthMut("pv-1").RecordSuccess()
+
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.PVSurplusAbsorbSoCCapPct = 88
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	got := targets[0].TargetW
+	if got > -1500 {
+		t.Errorf("TargetW = %.0f W — absorber must not blunt a discharge plan (want ≈ -4000 W)", got)
+	}
+}

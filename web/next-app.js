@@ -1708,6 +1708,11 @@
   // entries mean "no loadpoint for this driver" and the planet
   // falls back to legacy kW-only rendering.
   var loadpointsByDriver = null;
+  // Last successful /api/status payload — surfaced so secondary
+  // consumers (e.g. the EV modal's 5 s refresh) can read derived
+  // facts like siteHasPV() without re-fetching. `null` until the
+  // first fetch lands; consumers MUST handle null.
+  var lastStatusPayload = null;
   function fetchStatus() {
     Promise.all([
       fetch("/api/status").then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }),
@@ -1716,6 +1721,7 @@
       .then(function (results) {
         var data = results[0];
         var lp = results[1];
+        lastStatusPayload = data;
         if (lp && Array.isArray(lp.loadpoints)) {
           var idx = {};
           lp.loadpoints.forEach(function (l) {
@@ -1997,33 +2003,88 @@
     evModalBody.appendChild(p);
   }
 
-  // Schedule-control persistence across the modal's auto-refresh tick.
-  // refreshEvModal wipes evModalBody every poll; without these the
-  // user's in-progress edits to the schedule inputs would be reset
-  // every few seconds. The cached element is re-attached as long as
-  // the user has touched any field and hasn't yet hit Save / Clear,
-  // and the LP id hasn't changed (different planet clicked).
-  var schedCacheEl = null;
-  var schedCacheLpId = null;
-  var schedDirty = false;
+  // EV modal sub-elements held across refreshes. The status table is
+  // updated in place on every poll. The schedule section is mounted
+  // exactly once per (modal-open × LP) and is NEVER detached on a poll
+  // — detaching+reattaching a focused <input> blurs it mid-keystroke
+  // and resets caret position. After Save/Clear we set
+  // schedNeedsRebuild=true so the next poll picks up the new
+  // authoritative server state.
+  var statusTableEl = null;
+  var schedSectionEl = null;
+  var schedLpId = null;
+  var schedNeedsRebuild = false;
+
+  // Detect whether the site has any PV driver configured. Used to hide
+  // the "surplus charge from PV" option on PV-less sites where the
+  // bat-SoC unlock wouldn't have anything to grab anyway.
+  function siteHasPV(status) {
+    if (!status || !status.drivers) return false;
+    for (var k in status.drivers) {
+      if (Object.prototype.hasOwnProperty.call(status.drivers, k)) {
+        var dr = status.drivers[k];
+        if (dr && typeof dr.pv_w === "number") return true;
+      }
+    }
+    return false;
+  }
 
   function refreshEvModal() {
     // Pass driver query if known so the backend can scope the response
     // to the clicked planet (multi-EV setups). Falls back to whatever
     // the backend returns when no driver filter is honored.
     var url = "/api/ev/status" + (evModalDriver ? "?driver=" + encodeURIComponent(evModalDriver) : "");
+    // siteHasPV is a static-per-config check, so we read the most
+    // recent payload cached by fetchStatus() instead of issuing a
+    // duplicate /api/status fetch on every 5 s modal tick. Falls back
+    // to "no PV" until the dashboard's own fetchStatus lands once.
     Promise.all([
       fetch(url).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
       fetch("/api/loadpoints").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
     ]).then(function (results) {
       var d = results[0];
       var lps = results[1];
-      if (!d || d.connected === false) {
+      var status = lastStatusPayload;
+      var hasLoadpoints = lps && Array.isArray(lps.loadpoints) && lps.loadpoints.length > 0;
+      var carConnected = d && d.connected !== false;
+      // Hard short-circuit only when there's NOTHING to show: no
+      // active EV AND no configured loadpoint. Otherwise we fall
+      // through so the schedule editor stays reachable — operators
+      // routinely want to set tomorrow morning's target before
+      // plugging in tonight, and the schedule is LP state (persisted
+      // across restarts), not driver state.
+      if (!carConnected && !hasLoadpoints) {
         setEvModalMessage("No EV charger connected");
+        statusTableEl = null;
+        schedSectionEl = null;
+        schedLpId = null;
         return;
       }
-      evModalBody.textContent = "";
-      evModalBody.appendChild(renderEvStatusTable(d));
+      // Status table: replace in place so the rest of the modal body
+      // (including any mounted schedule section) is untouched. On the
+      // very first call evModalBody may still contain the placeholder
+      // from setEvModalMessage; wipe only when we have no anchor yet.
+      // When no car is connected but loadpoints exist, render a
+      // dim placeholder note in place of the live status table so
+      // the modal still has a header before the schedule editor.
+      var freshStatus;
+      if (carConnected) {
+        freshStatus = renderEvStatusTable(d);
+      } else {
+        freshStatus = document.createElement("p");
+        freshStatus.style.color = "var(--text-dim)";
+        freshStatus.style.fontStyle = "italic";
+        freshStatus.style.margin = "0 0 0.6rem 0";
+        freshStatus.textContent = "No car connected — schedule below is saved to the loadpoint and applies on next plug-in.";
+      }
+      if (statusTableEl && statusTableEl.parentNode === evModalBody) {
+        evModalBody.replaceChild(freshStatus, statusTableEl);
+      } else {
+        evModalBody.textContent = "";
+        evModalBody.appendChild(freshStatus);
+      }
+      statusTableEl = freshStatus;
+
       // Match the modal's driver to a configured loadpoint; the
       // surplus-only control only makes sense when the driver is
       // wired to one. With no driver filter we pick the first
@@ -2038,20 +2099,47 @@
             }
           }
         }
+        // Prefer a plugged-in loadpoint when no driver filter is active —
+        // that's the one the operator is most likely thinking about. Fall
+        // back to the first configured loadpoint so the schedule editor
+        // is still reachable when no car is currently connected (the
+        // schedule is persistent loadpoint state, not driver state, and
+        // operators routinely want to set tomorrow morning's target
+        // before plugging in tonight).
         if (!matched) {
           for (var j = 0; j < lps.loadpoints.length; j++) {
             if (lps.loadpoints[j].plugged_in) { matched = lps.loadpoints[j]; break; }
           }
         }
+        if (!matched) {
+          matched = lps.loadpoints[0];
+        }
       }
       if (matched) {
-        if (schedDirty && schedCacheEl && schedCacheLpId === matched.id) {
-          // User is mid-edit: re-attach their dirty form instead of
-          // rebuilding it from server state and trampling input.
-          evModalBody.appendChild(schedCacheEl);
-        } else {
-          evModalBody.appendChild(buildScheduleControl(matched));
+        // Build schedule exactly once per LP. Polling never rebuilds
+        // it — inputs keep their focus, value and caret position. Only
+        // a Save / Clear (which sets schedNeedsRebuild) or switching
+        // to a different LP (planet) triggers a fresh build.
+        var lpChanged = schedSectionEl == null || schedLpId !== matched.id;
+        if (lpChanged || schedNeedsRebuild) {
+          if (schedSectionEl && schedSectionEl.parentNode === evModalBody) {
+            evModalBody.removeChild(schedSectionEl);
+          }
+          schedSectionEl = buildScheduleControl(matched, siteHasPV(status));
+          schedLpId = matched.id;
+          schedNeedsRebuild = false;
+          evModalBody.appendChild(schedSectionEl);
+        } else if (schedSectionEl.parentNode !== evModalBody) {
+          // Modal was previously closed: body got wiped but our
+          // cached section is still valid — re-attach.
+          evModalBody.appendChild(schedSectionEl);
         }
+      } else {
+        if (schedSectionEl && schedSectionEl.parentNode === evModalBody) {
+          evModalBody.removeChild(schedSectionEl);
+        }
+        schedSectionEl = null;
+        schedLpId = null;
       }
     }).catch(function () {
       setEvModalMessage("Failed to load EV status");
@@ -2065,7 +2153,7 @@
   // deadline forward each day when Recurring is set, and arms the
   // surplus-grab whenever the home battery sits at or above the
   // threshold (with 5 pp release hysteresis).
-  function buildScheduleControl(lp) {
+  function buildScheduleControl(lp, hasPV) {
     var sched = (lp && lp.schedule) || {};
     // Convert "minutes-of-day-UTC" to a "HH:MM" string in the
     // browser's local zone. The UI shows local time everywhere;
@@ -2081,13 +2169,89 @@
     var initSurplus = savedUnlock > 0;
     var initUnlock = savedUnlock > 0 ? savedUnlock : 50;
 
+    // Outer wrapper holds two distinct sections:
+    //  1. PV mode (surplus-only toggle) — saves immediately on click
+    //  2. Schedule (target SoC + deadline + bat-SoC unlock) — Save button
+    // They're separated so it's obvious which controls the Save button
+    // owns. Earlier we kept the surplus toggle inside the Schedule
+    // section and operators couldn't tell whether Save covered it.
+    var wrap = document.createElement("div");
+    wrap.style.marginTop = "0.75rem";
+    wrap.style.paddingTop = "0.6rem";
+    wrap.style.borderTop = "1px solid var(--line)";
+
+    // ---- Section 1: PV mode (surplus-only) ----
+    // Per-loadpoint hard flag, *independent* of any schedule. When on,
+    // dispatch refuses to import grid for this loadpoint regardless of
+    // what the MPC plans. Operators can run with this alone (no target,
+    // no deadline — just "harvest PV when there's enough") or layer a
+    // schedule on top below.
+    var soBox = document.createElement("div");
+    soBox.style.marginBottom = "0.8rem";
+    soBox.style.paddingBottom = "0.7rem";
+    soBox.style.borderBottom = "1px solid var(--line)";
+
+    var soEyebrow = document.createElement("div");
+    soEyebrow.textContent = "PV Mode";
+    soEyebrow.style.fontFamily = "var(--mono)";
+    soEyebrow.style.fontSize = "0.7rem";
+    soEyebrow.style.letterSpacing = "0.18em";
+    soEyebrow.style.textTransform = "uppercase";
+    soEyebrow.style.color = "var(--text-dim)";
+    soEyebrow.style.marginBottom = "0.45rem";
+    soBox.appendChild(soEyebrow);
+
+    var soWrap = document.createElement("label");
+    soWrap.style.display = "flex";
+    soWrap.style.alignItems = "center";
+    soWrap.style.gap = "0.4rem";
+    soWrap.style.fontSize = "0.85rem";
+    soWrap.style.cursor = "pointer";
+    var soCb = document.createElement("input");
+    soCb.type = "checkbox";
+    soCb.checked = !!(lp && lp.surplus_only);
+    soCb.style.accentColor = "var(--accent-e)";
+    var soText = document.createElement("span");
+    soText.textContent = "Surplus only (PV exports only — never imports grid)";
+    soWrap.appendChild(soCb);
+    soWrap.appendChild(soText);
+
+    var soStatus = document.createElement("small");
+    soStatus.style.display = "block";
+    soStatus.style.color = "var(--text-dim)";
+    soStatus.style.marginTop = "0.25rem";
+    soStatus.style.marginLeft = "1.4rem";
+    soStatus.style.minHeight = "1em";
+    soStatus.textContent = "Saves automatically on click. Independent of the schedule below.";
+
+    soBox.appendChild(soWrap);
+    soBox.appendChild(soStatus);
+    wrap.appendChild(soBox);
+
+    soCb.addEventListener("change", function () {
+      soCb.disabled = true;
+      soStatus.textContent = "Saving…";
+      fetch("/api/loadpoints/" + encodeURIComponent(lp.id) + "/target", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ surplus_only: soCb.checked }),
+      }).then(function () {
+        soCb.disabled = false;
+        soStatus.textContent = "Saved. Independent of the schedule below.";
+        // Rebuild on next poll so the schedule section reflects any
+        // server-side side effects (e.g. soc_source recompute).
+        schedNeedsRebuild = true;
+      }).catch(function () {
+        soCb.disabled = false;
+        soStatus.textContent = "Save failed — try again.";
+      });
+    });
+
+    // ---- Section 2: Schedule ----
     var box = document.createElement("div");
-    box.style.marginTop = "0.75rem";
-    box.style.paddingTop = "0.6rem";
-    box.style.borderTop = "1px solid var(--line)";
 
     var eyebrow = document.createElement("div");
-    eyebrow.textContent = "Schedule";
+    eyebrow.textContent = "Schedule (grid charging)";
     eyebrow.style.fontFamily = "var(--mono)";
     eyebrow.style.fontSize = "0.7rem";
     eyebrow.style.letterSpacing = "0.18em";
@@ -2095,6 +2259,27 @@
     eyebrow.style.color = "var(--text-dim)";
     eyebrow.style.marginBottom = "0.55rem";
     box.appendChild(eyebrow);
+
+    var schedExplainer = document.createElement("div");
+    schedExplainer.textContent = "Target SoC by a deadline. The planner uses cheap grid hours to fill the gap PV can't cover.";
+    schedExplainer.style.fontSize = "0.72rem";
+    schedExplainer.style.color = "var(--text-dim)";
+    schedExplainer.style.marginBottom = "0.5rem";
+    box.appendChild(schedExplainer);
+
+    // Schedule is persistent loadpoint state — operators can configure
+    // tomorrow morning's target tonight before plugging in. Show a
+    // small hint when the loadpoint isn't currently connected so saved
+    // edits don't feel inert: they'll apply at the next plug-in.
+    if (lp && !lp.plugged_in) {
+      var unpluggedHint = document.createElement("div");
+      unpluggedHint.textContent = "Car not plugged in. Edits are saved and apply at next plug-in.";
+      unpluggedHint.style.fontSize = "0.72rem";
+      unpluggedHint.style.color = "var(--text-dim)";
+      unpluggedHint.style.marginBottom = "0.5rem";
+      unpluggedHint.style.fontStyle = "italic";
+      box.appendChild(unpluggedHint);
+    }
 
     function row(labelText, controlEl) {
       var r = document.createElement("div");
@@ -2178,7 +2363,7 @@
     }
 
     var recWrap = checkbox(initRec, "Recurring (every day)");
-    var surWrap = checkbox(initSurplus, "Surplus charge from home battery");
+    var surWrap = checkbox(initSurplus && !!hasPV, "Surplus charge from PV");
     var recCb = recWrap.input;
     var surCb = surWrap.input;
 
@@ -2191,7 +2376,12 @@
     checkRow.style.gap = "0.35rem";
     checkRow.style.marginBottom = "0.55rem";
     checkRow.appendChild(recWrap);
-    checkRow.appendChild(surWrap);
+    // Surplus-from-PV only makes sense on sites with a PV driver — the
+    // bat-SoC unlock would have no surplus to grab otherwise. Omit the
+    // checkbox + threshold entirely on PV-less sites.
+    if (hasPV) {
+      checkRow.appendChild(surWrap);
+    }
     box.appendChild(checkRow);
 
     var unlockHint = document.createElement("small");
@@ -2200,10 +2390,13 @@
     unlockHint.style.marginTop = "0.2rem";
     unlockHint.style.marginBottom = "0.3rem";
     unlockHint.textContent = "Always grab PV surplus when home battery ≥ threshold.";
-    box.appendChild(unlockHint);
 
     var thresholdRow = row("Threshold", unlockWrap);
-    box.appendChild(thresholdRow);
+
+    if (hasPV) {
+      box.appendChild(unlockHint);
+      box.appendChild(thresholdRow);
+    }
 
     function applySurplusGate() {
       var on = surCb.checked;
@@ -2212,8 +2405,10 @@
       thresholdRow.style.pointerEvents = on ? "auto" : "none";
       unlockHint.style.opacity = on ? "1" : "0.55";
     }
-    applySurplusGate();
-    surCb.addEventListener("change", applySurplusGate);
+    if (hasPV) {
+      applySurplusGate();
+      surCb.addEventListener("change", applySurplusGate);
+    }
 
     // Actions
     var btnRow = document.createElement("div");
@@ -2244,7 +2439,7 @@
       return b;
     }
     var clearBtn = mkBtn("Clear", false);
-    var saveBtn = mkBtn(hasSched ? "Update" : "Save", true);
+    var saveBtn = mkBtn(hasSched ? "Update schedule" : "Set schedule", true);
     clearBtn.disabled = !hasSched;
     if (!hasSched) clearBtn.style.opacity = "0.4";
     btnRow.appendChild(clearBtn);
@@ -2258,28 +2453,21 @@
     status.style.minHeight = "1em";
     box.appendChild(status);
 
-    // Cache + dirty wiring: each user edit flips schedDirty=true so
-    // the auto-refresh keeps THIS element on screen instead of
-    // rebuilding it from stale server state.
-    schedCacheEl = box;
-    schedCacheLpId = lp.id;
-    schedDirty = false;
-    function markDirty() { schedDirty = true; }
-    [socWrap.input, timeInp, unlockWrap.input].forEach(function (el) {
-      el.addEventListener("input", markDirty);
-      el.addEventListener("change", markDirty);
-    });
-    recCb.addEventListener("change", markDirty);
-
+    // Save and Clear both flag schedNeedsRebuild so the next poll
+    // rebuilds the section from the new authoritative server state
+    // (e.g. so the button label flips from "Save" → "Update" once a
+    // schedule exists). Polling never rebuilds otherwise — the cached
+    // schedSectionEl stays mounted and inputs keep focus.
     saveBtn.addEventListener("click", function () {
       saveBtn.disabled = true;
       clearBtn.disabled = true;
       status.textContent = "Saving…";
       var localHHMM = timeInp.value || initLocalHHMM;
       var minUTC = localHHMMToUtcMins(localHHMM);
-      // Surplus checkbox gates the threshold: when off, the threshold
-      // is sent as 0 (the backend interprets 0 as "feature disabled").
-      var unlockVal = surCb.checked ? Number(unlockWrap.input.value) : 0;
+      // Surplus checkbox gates the threshold: when off (or hidden on
+      // PV-less sites), the threshold is sent as 0 — the backend
+      // interprets 0 as "feature disabled".
+      var unlockVal = (hasPV && surCb.checked) ? Number(unlockWrap.input.value) : 0;
       var body = {
         schedule: {
           soc_pct: Number(socWrap.input.value),
@@ -2295,8 +2483,7 @@
       }).then(function (r) {
         if (!r.ok) throw new Error("HTTP " + r.status);
         status.textContent = "Saved.";
-        schedDirty = false;
-        schedCacheEl = null;
+        schedNeedsRebuild = true;
         refreshEvModal();
       }).catch(function (e) {
         status.textContent = "Save failed: " + e.message;
@@ -2316,8 +2503,7 @@
       }).then(function (r) {
         if (!r.ok) throw new Error("HTTP " + r.status);
         status.textContent = "Cleared.";
-        schedDirty = false;
-        schedCacheEl = null;
+        schedNeedsRebuild = true;
         refreshEvModal();
       }).catch(function (e) {
         status.textContent = "Clear failed: " + e.message;
@@ -2325,7 +2511,8 @@
       });
     });
 
-    return box;
+    wrap.appendChild(box);
+    return wrap;
   }
 
   function utcMinsToLocalHHMM(min) {

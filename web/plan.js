@@ -366,6 +366,37 @@
       ctx.setLineDash([]);
     }
 
+    // Planned EV charging — site-signed load (always ≥ 0, plotted above
+    // zero). Solid cyan so it's distinguishable from the dashed amber
+    // load forecast and the green PV trace. Only drawn when the plan
+    // carries a loadpoint dimension (loadpoint_w field present).
+    if (plan && plan.actions && plan.actions.some(a => a.loadpoint_w != null)) {
+      ctx.strokeStyle = 'rgba(34,211,238,0.95)';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      let fEv = true;
+      for (const a of plan.actions) {
+        if (a.slot_start_ms > tMax) break;
+        if (a.loadpoint_w == null) continue;
+        const x = xScale(a.slot_start_ms);
+        const y = powerY(a.loadpoint_w);
+        if (fEv) { ctx.moveTo(x, y); fEv = false; }
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      // EV step-fill at low opacity makes the on/off slots readable at a
+      // glance — the line alone hides the "off between two on" slots.
+      ctx.fillStyle = 'rgba(34,211,238,0.12)';
+      for (const a of plan.actions) {
+        if (a.slot_start_ms > tMax) break;
+        if (!a.loadpoint_w || a.loadpoint_w <= 0) continue;
+        const x0 = xScale(a.slot_start_ms);
+        const x1 = xScale(a.slot_start_ms + a.slot_len_min * 60 * 1000);
+        const yTop = powerY(a.loadpoint_w);
+        ctx.fillRect(x0, yTop, Math.max(1, x1 - x0 - 1), powerYCenter - yTop);
+      }
+    }
+
     // Power zero-line
     ctx.strokeStyle = 'rgba(255,255,255,0.25)';
     ctx.lineWidth = 1;
@@ -657,6 +688,10 @@
         lines.push(`<div class="tip-row"><span title="Solar generation the plan assumes for this slot">PV forecast</span><b>${pvGen.toFixed(1)} kW</b></div>`);
       }
       if (a.load_w != null) lines.push(`<div class="tip-row"><span title="Household consumption the plan assumes for this slot">Load forecast</span><b>${(a.load_w / 1000).toFixed(1)} kW</b></div>`);
+      if (a.loadpoint_w != null && a.loadpoint_w > 0) {
+        const evSoc = a.loadpoint_soc_pct != null ? ` → ${a.loadpoint_soc_pct.toFixed(0)}%` : '';
+        lines.push(`<div class="tip-row"><span title="Planned EV charging power for this slot">EV charging</span><b>${(a.loadpoint_w / 1000).toFixed(1)} kW${evSoc}</b></div>`);
+      }
       if (a.battery_w != null) {
         const dir = a.battery_w > 100 ? 'charge' : a.battery_w < -100 ? 'discharge' : 'idle';
         lines.push(`<div class="tip-row"><span title="Planned battery power. + = charging, − = discharging">Battery</span><b>${(a.battery_w / 1000).toFixed(1)} kW (${dir})</b></div>`);

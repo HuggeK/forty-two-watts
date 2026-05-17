@@ -348,6 +348,29 @@ func main() {
 		}
 		return s, !s.Empty()
 	})
+	// Persist surplus_only toggles the same way schedules persist —
+	// state.config key `loadpoint_surplus_only:<id>` stores "true" or
+	// "false". Operators toggle this from the dashboard EV modal, not
+	// YAML, so the previous in-memory-only behaviour reverted the
+	// flag on every restart.
+	const lpSurplusKeyPrefix = "loadpoint_surplus_only:"
+	lpMgr.SetSurplusOnlySaver(func(id string, v bool) {
+		key := lpSurplusKeyPrefix + id
+		val := "false"
+		if v {
+			val = "true"
+		}
+		if err := st.SaveConfig(key, val); err != nil {
+			slog.Warn("failed to persist loadpoint surplus_only", "lp", id, "err", err)
+		}
+	})
+	lpMgr.HydrateSurplusOnly(func(id string) (bool, bool) {
+		v, ok := st.LoadConfig(lpSurplusKeyPrefix + id)
+		if !ok || v == "" {
+			return false, false
+		}
+		return v == "true", true
+	})
 	// Seed any recurring deadlines from boot — without this the first
 	// dispatch tick would race with an empty target_time and might
 	// miss the deadline penalty for ~5 s.
@@ -820,23 +843,49 @@ func main() {
 				if lpController != nil {
 					lpController.SetGridDeferred(st.ID, deferGridPlan)
 				}
+				// Surplus-only sources, in order of precedence:
+				//   1. Operator's explicit surplus_only flag on the LP
+				//   2. MPC grid-funded planning deferral (target past
+				//      published prices)
+				//   3. Runtime bat-SoC unlock arming — when the home
+				//      battery is at/above the schedule's threshold AND
+				//      live PV surplus is available, the dispatch layer
+				//      already treats the LP as surplus-only. Without
+				//      threading it into the MPC spec here, the plan
+				//      would prescribe battery→EV transfers that
+				//      dispatch then has to censor — producing
+				//      misleading slot entries the operator sees in
+				//      /api/mpc/plan that never actually execute.
+				batSoCArmed := false
+				if lpController != nil {
+					batSoCArmed = lpController.IsBatSoCArmed(st.ID)
+				}
+				// NoBatteryToEV mirrors the site-wide ctrl.BatteryCoversEV
+				// flag (inverted). Plumbing the constraint into the DP
+				// here means the planner stops scheduling battery→EV
+				// transfers that dispatch's safety net would just clamp
+				// at runtime; this closes the plan↔reality divergence
+				// where operators saw "plan: 7 kW discharge + 11 kW EV"
+				// while live execution held the battery at house-only
+				// levels. Take ctrlMu for the bool read.
+				ctrlMu.Lock()
+				noBatteryToEV := !ctrl.BatteryCoversEV
+				ctrlMu.Unlock()
 				return &mpc.LoadpointSpec{
-					ID:              st.ID,
-					CapacityWh:      capWh,
-					Levels:          11,
-					MinPct:          0,
-					MaxPct:          maxPct,
-					InitialSoCPct:   initSoC,
-					PluggedIn:       true,
-					TargetSoCPct:    targetPct,
-					TargetSlotIdx:   targetSlot,
-					MaxChargeW:      st.MaxChargeW,
-					AllowedStepsW:   st.AllowedStepsW,
+					ID:               st.ID,
+					CapacityWh:       capWh,
+					Levels:           11,
+					MinPct:           0,
+					MaxPct:           maxPct,
+					InitialSoCPct:    initSoC,
+					PluggedIn:        true,
+					TargetSoCPct:     targetPct,
+					TargetSlotIdx:    targetSlot,
+					MaxChargeW:       st.MaxChargeW,
+					AllowedStepsW:    st.AllowedStepsW,
 					ChargeEfficiency: 0.9,
-					// Either operator-configured surplus_only OR our
-					// "wait for tomorrow's prices" defer triggers MPC's
-					// no-grid constraint for this LP.
-					SurplusOnly: st.SurplusOnly || deferGridPlan,
+					SurplusOnly:      st.SurplusOnly || deferGridPlan || batSoCArmed,
+					NoBatteryToEV:    noBatteryToEV,
 				}
 			}
 			return nil
@@ -1065,6 +1114,44 @@ func main() {
 					continue
 				}
 				if time.UnixMilli(a.SlotStartMs).After(endOfDay) {
+					break
+				}
+				surplus := -a.PVW - a.LoadW
+				if !any || surplus > peak {
+					peak = surplus
+					any = true
+				}
+			}
+			if !any {
+				return 0, false
+			}
+			return peak, true
+		})
+
+		// Near-term peak surplus: same scan but capped at now + window.
+		// pickSurplusSteps consults this to decide if a 3Φ window is
+		// imminent enough to be worth waiting for. When near-term <
+		// 3Φ minimum but day-peak is, we'd rather charge 1Φ now and
+		// switch to 3Φ later than sit idle waiting.
+		lpController.SetNearTermPeakSurplusW(func(window time.Duration) (float64, bool) {
+			if mpcSvc == nil {
+				return 0, false
+			}
+			plan := mpcSvc.Latest()
+			if plan == nil || len(plan.Actions) == 0 {
+				return 0, false
+			}
+			now := time.Now()
+			horizon := now.Add(window)
+			var peak float64
+			any := false
+			for _, a := range plan.Actions {
+				slotEnd := time.UnixMilli(a.SlotStartMs).Add(
+					time.Duration(a.SlotLenMin) * time.Minute)
+				if slotEnd.Before(now) {
+					continue
+				}
+				if time.UnixMilli(a.SlotStartMs).After(horizon) {
 					break
 				}
 				surplus := -a.PVW - a.LoadW
@@ -1618,20 +1705,21 @@ func main() {
 			for k, v := range capacities { capsSnap[k] = v }
 			capMu.RUnlock()
 
-			// Surplus-only EV reserve: walk all loadpoints and sum
-			// MaxChargeW for any LP that is surplus_only AND has an EV
-			// plugged in. Result is injected into ctrl.EVSurplusOnlyReserveW
-			// so dispatch caps battery charge to leave that much PV
-			// headroom for the EV controller to claim. See
-			// dispatch.go EVSurplusOnlyReserveW + the (energy/legacy) cap
-			// blocks. Computed every tick so toggling surplus_only or
-			// plugging/unplugging an EV takes effect immediately.
-			var evReserveW float64
-			for _, st := range lpMgr.States() {
-				if st.SurplusOnly && st.PluggedIn {
-					evReserveW += st.MaxChargeW
-				}
-			}
+			// Surplus-only EV reserve: aggregate PV headroom to leave
+			// for surplus_only loadpoints. Per LP, reserves
+			// min(MaxChargeW, CurrentPowerW + EVRampHeadroomW) so the
+			// figure tracks the EV's actual draw rather than its
+			// theoretical max — when an EV is physically holding at
+			// e.g. 2.5 kW (1Φ × 11 A under phase hysteresis), the prior
+			// "reserve = MaxChargeW = 11 kW" form ate ~8.5 kW of the
+			// available surplus and starved the battery on
+			// over-forecast PV slots even when the plan said charge.
+			// Result is injected into ctrl.EVSurplusOnlyReserveW and
+			// consumed by dispatch.go in both the energy and the
+			// legacy/reactive paths. Computed every tick so toggling
+			// surplus_only, plugging/unplugging, or an EV ramp picks
+			// up immediately.
+			evReserveW := loadpoint.SurplusReserveW(lpMgr.States())
 
 			ctrlMu.Lock()
 			ctrl.EVSurplusOnlyReserveW = evReserveW
