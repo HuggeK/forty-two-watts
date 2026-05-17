@@ -99,6 +99,16 @@ type Controller struct {
 	// shifts. nil disables this — the loadpoint then stays on 3Φ-
 	// only forever (matching the conservative original behaviour).
 	peakRemainingSurplusW func() (float64, bool)
+	// nearTermPeakSurplusW returns the peak PV-minus-load surplus
+	// over the next `window` from now (in plan slot resolution).
+	// pickSurplusSteps consults this *before* the whole-day peak so
+	// the LP can fall back to 1Φ when 3Φ isn't imminent — captures
+	// "we have 3 kW now and won't see 4.1 kW for the next 30 min,
+	// start charging at 1Φ instead of waiting." The day-peak gate
+	// still applies for the longer-term "lock 1Φ for the whole day"
+	// decision so a passing cloud doesn't commit the LP to 1Φ for
+	// the entire afternoon. Optional; nil means no near-term gate.
+	nearTermPeakSurplusW func(window time.Duration) (float64, bool)
 
 	// phaseLockMu protects phaseLocked1P + phaseLockedAt. The 1Φ
 	// lock is sticky for the rest of the day so a slowly recovering
@@ -346,6 +356,19 @@ func (c *Controller) SetPeakRemainingSurplusW(f func() (float64, bool)) {
 		return
 	}
 	c.peakRemainingSurplusW = f
+}
+
+// SetNearTermPeakSurplusW wires the short-horizon "peak surplus over
+// the next window" reader used by pickSurplusSteps to decide whether
+// a 3Φ start is imminent. Typical implementation iterates the MPC
+// plan's slots starting now and walks until `now + window`, returning
+// the max(−pvW − loadW) seen. Pass nil to keep the original "wait for
+// today's day-peak forecast" behaviour.
+func (c *Controller) SetNearTermPeakSurplusW(f func(window time.Duration) (float64, bool)) {
+	if c == nil {
+		return
+	}
+	c.nearTermPeakSurplusW = f
 }
 
 // SetBatSoCProvider wires the home-battery SoC reader used by the
@@ -1254,14 +1277,30 @@ func (c *Controller) pickSurplusSteps(now time.Time, lpCfg Config) []float64 {
 		// All allowed steps — driver picks the phase.
 		return lpCfg.AllowedStepsW
 	}
+	if minStep3 <= 0 {
+		return steps3
+	}
+
+	// Near-term gate: even if today's whole-day peak forecast will
+	// reach 3Φ minimum eventually, if the next 30 min won't, return
+	// 1Φ-allowed steps NOW so the LP captures the surplus that's
+	// here today instead of waiting for a peak that's hours away.
+	// Day-lock NOT set here — this is a "transient cloud" not a
+	// "low-PV day" verdict, so a later 3Φ window during the same
+	// day can still trigger a contactor cycle into 3Φ (the
+	// surplusMinPauseHold ≥ 35 s hysteresis caps the cycle rate).
+	if c.nearTermPeakSurplusW != nil {
+		const nearTermWindow = 30 * time.Minute
+		if nearPeak, ok := c.nearTermPeakSurplusW(nearTermWindow); ok && nearPeak < minStep3 {
+			return lpCfg.AllowedStepsW
+		}
+	}
+
 	if c.peakRemainingSurplusW == nil {
 		return steps3
 	}
 	peak, ok := c.peakRemainingSurplusW()
 	if !ok {
-		return steps3
-	}
-	if minStep3 <= 0 {
 		return steps3
 	}
 	if peak >= minStep3 {

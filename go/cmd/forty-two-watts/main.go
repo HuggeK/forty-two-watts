@@ -1105,6 +1105,44 @@ func main() {
 			return peak, true
 		})
 
+		// Near-term peak surplus: same scan but capped at now + window.
+		// pickSurplusSteps consults this to decide if a 3Φ window is
+		// imminent enough to be worth waiting for. When near-term <
+		// 3Φ minimum but day-peak is, we'd rather charge 1Φ now and
+		// switch to 3Φ later than sit idle waiting.
+		lpController.SetNearTermPeakSurplusW(func(window time.Duration) (float64, bool) {
+			if mpcSvc == nil {
+				return 0, false
+			}
+			plan := mpcSvc.Latest()
+			if plan == nil || len(plan.Actions) == 0 {
+				return 0, false
+			}
+			now := time.Now()
+			horizon := now.Add(window)
+			var peak float64
+			any := false
+			for _, a := range plan.Actions {
+				slotEnd := time.UnixMilli(a.SlotStartMs).Add(
+					time.Duration(a.SlotLenMin) * time.Minute)
+				if slotEnd.Before(now) {
+					continue
+				}
+				if time.UnixMilli(a.SlotStartMs).After(horizon) {
+					break
+				}
+				surplus := -a.PVW - a.LoadW
+				if !any || surplus > peak {
+					peak = surplus
+					any = true
+				}
+			}
+			if !any {
+				return 0, false
+			}
+			return peak, true
+		})
+
 		lpController.SetSiteSurplusForEV(func() (float64, bool) {
 			meterDriver := cfg.SiteMeterDriver()
 			if meterDriver == "" {
