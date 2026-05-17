@@ -1705,20 +1705,21 @@ func main() {
 			for k, v := range capacities { capsSnap[k] = v }
 			capMu.RUnlock()
 
-			// Surplus-only EV reserve: walk all loadpoints and sum
-			// MaxChargeW for any LP that is surplus_only AND has an EV
-			// plugged in. Result is injected into ctrl.EVSurplusOnlyReserveW
-			// so dispatch caps battery charge to leave that much PV
-			// headroom for the EV controller to claim. See
-			// dispatch.go EVSurplusOnlyReserveW + the (energy/legacy) cap
-			// blocks. Computed every tick so toggling surplus_only or
-			// plugging/unplugging an EV takes effect immediately.
-			var evReserveW float64
-			for _, st := range lpMgr.States() {
-				if st.SurplusOnly && st.PluggedIn {
-					evReserveW += st.MaxChargeW
-				}
-			}
+			// Surplus-only EV reserve: aggregate PV headroom to leave
+			// for surplus_only loadpoints. Per LP, reserves
+			// min(MaxChargeW, CurrentPowerW + EVRampHeadroomW) so the
+			// figure tracks the EV's actual draw rather than its
+			// theoretical max — when an EV is physically holding at
+			// e.g. 2.5 kW (1Φ × 11 A under phase hysteresis), the prior
+			// "reserve = MaxChargeW = 11 kW" form ate ~8.5 kW of the
+			// available surplus and starved the battery on
+			// over-forecast PV slots even when the plan said charge.
+			// Result is injected into ctrl.EVSurplusOnlyReserveW and
+			// consumed by dispatch.go in both the energy and the
+			// legacy/reactive paths. Computed every tick so toggling
+			// surplus_only, plugging/unplugging, or an EV ramp picks
+			// up immediately.
+			evReserveW := loadpoint.SurplusReserveW(lpMgr.States())
 
 			ctrlMu.Lock()
 			ctrl.EVSurplusOnlyReserveW = evReserveW
