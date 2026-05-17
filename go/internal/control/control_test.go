@@ -2564,6 +2564,96 @@ func TestEnergyDispatchClampsDischargeWhenEVActuallyCharging(t *testing.T) {
 // Don't reverse a discharge plan: if the planner is deliberately
 // discharging this slot (e.g. evening-peak export), the absorber stays
 // out of the way regardless of live grid sign.
+// Regression for the operator-reported "battery sits idle while
+// surplus exports under EV reserve". Energy path, plan dictates
+// charge battery, EV is on surplus_only at 2.5 kW with 11 kW max,
+// and 3 kW is currently exporting at the real meter.
+//
+// dispatch.go:685 subtracts EVChargingW from gridW before the home-
+// battery decision so the battery sees "what export would exist
+// without the EV", which is 3000 + 2500 = 5500 W in this scenario.
+// The reserve cap then carves out reserveRemaining for the EV to
+// step up into.
+//
+// Pre-fix (reserve = full MaxChargeW = 11000): reserveRemaining
+// = 11000 - 2500 = 8500. ceiling = 5500 - 8500 = -3000 → 0. Battery
+// idles; surplus dumps to grid.
+//
+// Post-fix (reserve = CurrentPowerW + EVRampHeadroomW = 4500):
+// reserveRemaining = 4500 - 2500 = 2000. ceiling = 5500 - 2000 =
+// 3500. Battery picks up the bulk of the surplus while leaving 2 kW
+// of headroom for the EV to ramp up.
+//
+// The test sets EVSurplusOnlyReserveW directly to the value
+// loadpoint.SurplusReserveW would produce; the helper itself is
+// unit-tested separately in internal/loadpoint.
+func TestEnergyDispatchAbsorbsSurplusBeyondEVReserveActualDraw(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 1250, // plan: charge ~5 kW over the slot
+		Strategy:        "arbitrage",
+	}
+	store := seedStore(-3000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	store.Update("pv-1", telemetry.DerPV, -6000, nil, nil)
+	store.DriverHealthMut("pv-1").RecordSuccess()
+
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.EVChargingW = 2500
+	st.EVSurplusOnlyReserveW = 2500 + 2000 // = SurplusReserveW for one LP at 2.5 kW
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	if len(targets) != 1 {
+		t.Fatalf("want 1 target, got %d", len(targets))
+	}
+	got := targets[0].TargetW
+	// Want ≈ 3500 W. Allow ±400 W slack for time drift / formula edge.
+	if got < 3100 {
+		t.Errorf("TargetW = %.0f W — battery should absorb the surplus that the EV's adaptive reserve no longer hoards (want ≈ 3500 W, was 0 pre-fix)", got)
+	}
+	if got > 3900 {
+		t.Errorf("TargetW = %.0f W — battery overshoot, must leave EVRampHeadroomW (2 kW) of headroom for EV ramp-up (want ≈ 3500 W)", got)
+	}
+}
+
+// Companion: same setup, but with the PRE-FIX reserve (= full
+// MaxChargeW). The battery should be capped at or near 0. Documents
+// the bug this PR fixed and prevents accidental re-regression if
+// someone later restores the old reserve formula.
+func TestEnergyDispatchPreFixReserveStarvesBattery(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 1250,
+		Strategy:        "arbitrage",
+	}
+	store := seedStore(-3000, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"ferroamp", 0, 0.5},
+	})
+	store.Update("pv-1", telemetry.DerPV, -6000, nil, nil)
+	store.DriverHealthMut("pv-1").RecordSuccess()
+
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.EVChargingW = 2500
+	st.EVSurplusOnlyReserveW = 11000 // simulate the old "reserve = MaxChargeW" formula
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+	got := targets[0].TargetW
+	if got > 200 {
+		t.Errorf("TargetW = %.0f W — full-MaxChargeW reserve should starve the battery here; if you see a non-trivial target the dispatch reserve cap regressed", got)
+	}
+}
+
 func TestPVSurplusAbsorberDoesNotReverseDischarge(t *testing.T) {
 	now := time.Now()
 	dir := SlotDirective{

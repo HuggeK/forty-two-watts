@@ -1,17 +1,29 @@
 package loadpoint
 
 // EVRampHeadroomW is the per-LP buffer added on top of the EV's
-// current draw when computing the surplus reserve. It must cover the
-// worst-case single-step ramp the EV controller will take in the next
-// ~30 s: jumping from 1Φ at minimum to 3Φ at minimum (~6 A × 3 phases
-// × 230 V ≈ 4140 W, minus the current 1Φ × 6 A ≈ 1380 W draw, ≈ 2 kW
-// net). 2000 W is the round-trip step bound, generous enough that a
-// flapping EV controller doesn't immediately lose its ramp window
-// while still releasing the unused portion of MaxChargeW to the home
-// battery — the prior `evReserveW += MaxChargeW` reserved the EV's
-// theoretical max (often 11 kW for a 3Φ × 16 A wallbox) even when it
-// was physically holding at 2-3 kW, starving battery charge on
-// surprise PV slots.
+// current draw when computing the surplus reserve. It needs to cover
+// one single-amp step on the EV's current phase mode so the
+// controller can ramp up between ticks without the battery hoarding
+// the surplus.
+//
+// 2000 W comfortably covers:
+//   - any single-amp 1Φ step (+230 W) and 3Φ step (+690 W)
+//   - climbing 1Φ × 6 A → 1Φ × 14 A in one tick (+1840 W)
+//   - 1Φ-max → 3Φ-min crossover (1Φ × 16 A 3680 W → 3Φ × 6 A 4140 W,
+//     +460 W) — the realistic phase-change step the EV takes after
+//     climbing the 1Φ ladder
+//
+// What 2 kW does NOT cover is the direct 1Φ × 6 A → 3Φ × 6 A
+// cold-start jump (+2760 W). In practice pickSurplusSteps walks the
+// 1Φ ladder first, so this transition takes ~2 dispatch ticks (≈ 10 s)
+// instead of 1. Acceptable trade vs. the alternative — sizing the
+// headroom to that worst-case (3 kW) recreates the operator-reported
+// bug where the user's "3 kW exporting" scenario lines up exactly
+// with the reserve and the battery gets nothing.
+//
+// Tracking the LP's actual next reachable step via AllowedStepsW
+// would tighten this further; deferred until 2 kW proves wrong on a
+// real site.
 const EVRampHeadroomW = 2000
 
 // SurplusReserveW returns the aggregate PV headroom that must be
