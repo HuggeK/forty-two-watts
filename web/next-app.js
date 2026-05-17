@@ -2169,6 +2169,55 @@
       box.appendChild(unpluggedHint);
     }
 
+    // Surplus-only is a per-loadpoint hard flag that's *independent* of
+    // any schedule — when on, the dispatch refuses to import grid for
+    // this loadpoint regardless of what the MPC plans. Operators can
+    // run with surplus-only alone (no target, no deadline — just
+    // "harvest PV when there's enough") or layer a schedule on top
+    // ("opportunistic surplus, but also catch up via grid if cheap").
+    // Saved + applied immediately on every click via a dedicated POST
+    // — does not require Save to be pressed.
+    var sepRow = document.createElement("div");
+    sepRow.style.marginBottom = "0.55rem";
+    sepRow.style.paddingBottom = "0.55rem";
+    sepRow.style.borderBottom = "1px solid var(--line)";
+    var soWrap = document.createElement("label");
+    soWrap.style.display = "flex";
+    soWrap.style.alignItems = "center";
+    soWrap.style.gap = "0.4rem";
+    soWrap.style.fontSize = "0.85rem";
+    soWrap.style.cursor = "pointer";
+    var soCb = document.createElement("input");
+    soCb.type = "checkbox";
+    soCb.checked = !!(lp && lp.surplus_only);
+    soCb.style.accentColor = "var(--accent-e)";
+    var soText = document.createElement("span");
+    soText.textContent = "Surplus only (PV exports only — never imports grid)";
+    soWrap.appendChild(soCb);
+    soWrap.appendChild(soText);
+    var soHint = document.createElement("div");
+    soHint.style.fontSize = "0.72rem";
+    soHint.style.color = "var(--text-dim)";
+    soHint.style.marginTop = "0.25rem";
+    soHint.style.marginLeft = "1.4rem";
+    soHint.textContent = "Independent of the schedule below. Charges only when PV exports exceed your load. No deadline planning — no grid import.";
+    sepRow.appendChild(soWrap);
+    sepRow.appendChild(soHint);
+    box.appendChild(sepRow);
+    soCb.addEventListener("change", function () {
+      soCb.disabled = true;
+      fetch("/api/loadpoints/" + encodeURIComponent(lp.id) + "/target", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ surplus_only: soCb.checked }),
+      }).then(function () {
+        soCb.disabled = false;
+        // Rebuild on next poll so the schedule section reflects any
+        // server-side side effects (e.g. soc_source recompute).
+        schedNeedsRebuild = true;
+      }).catch(function () { soCb.disabled = false; });
+    });
+
     function row(labelText, controlEl) {
       var r = document.createElement("div");
       r.style.display = "flex";
