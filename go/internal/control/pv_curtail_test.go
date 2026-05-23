@@ -191,6 +191,114 @@ func TestComputePVCurtail_DeterministicSortable(t *testing.T) {
 	}
 }
 
+// ---- Manual hold ----
+
+// An active aggregate hold overrides whatever the planner directive
+// says — including taking effect when the planner isn't curtailing at
+// all. Used by the operator-side verification flow.
+func TestComputePVCurtail_ManualHoldOverridesPlanner(t *testing.T) {
+	st := NewState(0, 100, "meter")
+	st.SlotDirective = stubSlotDirective(SlotDirective{PVLimitW: 0}) // planner not curtailing
+	st.SupportsPVCurtail = map[string]bool{"sungrow": true, "solaredge": true}
+	store := telemetry.NewStore()
+	emitPV(t, store, "sungrow", -2000)
+	emitPV(t, store, "solaredge", -2000)
+
+	st.SetPVManualHold(PVManualHold{LimitW: 1000, ExpiresAt: time.Now().Add(time.Minute)})
+
+	got := findCurtail(ComputePVCurtail(st, store))
+	if len(got) != 2 {
+		t.Fatalf("want 2 targets (aggregate hold split across both), got %+v", got)
+	}
+	// 1000 W cap split proportionally over equal-output drivers → 500/500.
+	if abs(got["sungrow"]-500) > 1e-3 {
+		t.Errorf("sungrow: want 500, got %.2f", got["sungrow"])
+	}
+	if abs(got["solaredge"]-500) > 1e-3 {
+		t.Errorf("solaredge: want 500, got %.2f", got["solaredge"])
+	}
+}
+
+// Driver-scoped hold caps that one driver only and leaves the others
+// uncurtailed. Lets the operator verify a single inverter's curtail
+// implementation against live hardware without throttling the rest.
+func TestComputePVCurtail_ManualHoldScopedToOneDriver(t *testing.T) {
+	st := NewState(0, 100, "meter")
+	st.SlotDirective = stubSlotDirective(SlotDirective{PVLimitW: 0})
+	st.SupportsPVCurtail = map[string]bool{"sungrow": true, "solaredge": true}
+	store := telemetry.NewStore()
+	emitPV(t, store, "sungrow", -2000)
+	emitPV(t, store, "solaredge", -2000)
+
+	st.SetPVManualHold(PVManualHold{
+		Driver:    "solaredge",
+		LimitW:    800,
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+
+	got := findCurtail(ComputePVCurtail(st, store))
+	if _, ok := got["sungrow"]; ok {
+		t.Errorf("sungrow is out of scope; should not be curtailed: %+v", got)
+	}
+	if abs(got["solaredge"]-800) > 1e-3 {
+		t.Errorf("solaredge: want 800, got %.2f", got["solaredge"])
+	}
+}
+
+// Expired hold falls back cleanly. If the planner is also not asking
+// for curtailment, and a previous tick had curtailed the driver under
+// the hold, the driver must be released with LimitW=0.
+func TestComputePVCurtail_ExpiredHoldReleasesDriver(t *testing.T) {
+	st := NewState(0, 100, "meter")
+	st.SlotDirective = stubSlotDirective(SlotDirective{PVLimitW: 0})
+	st.SupportsPVCurtail = map[string]bool{"solaredge": true}
+	store := telemetry.NewStore()
+	emitPV(t, store, "solaredge", -2000)
+
+	// Tick 1: hold active, driver capped.
+	st.SetPVManualHold(PVManualHold{
+		Driver:    "solaredge",
+		LimitW:    500,
+		ExpiresAt: time.Now().Add(100 * time.Millisecond),
+	})
+	t1 := findCurtail(ComputePVCurtail(st, store))
+	if abs(t1["solaredge"]-500) > 1e-3 {
+		t.Fatalf("tick1: want solaredge=500, got %+v", t1)
+	}
+
+	// Tick 2: simulate expiry by jumping past ExpiresAt.
+	st.ManualPVHold.ExpiresAt = time.Now().Add(-time.Second)
+	t2 := ComputePVCurtail(st, store)
+	if len(t2) != 1 || t2[0].Driver != "solaredge" || t2[0].LimitW != 0 {
+		t.Errorf("tick2: want a single release target {solaredge, 0}, got %+v", t2)
+	}
+	// And the hold itself should be evicted as a side effect of GetPVManualHold.
+	if _, active := st.GetPVManualHold(time.Now()); active {
+		t.Errorf("hold should be evicted after expiry")
+	}
+}
+
+// Hold targeting a driver that doesn't advertise pv-curtail is silently
+// skipped — ComputePVCurtail never dispatches to a driver that wouldn't
+// know how to handle the payload.
+func TestComputePVCurtail_ManualHoldOnUnsupportedDriverSkipped(t *testing.T) {
+	st := NewState(0, 100, "meter")
+	st.SlotDirective = stubSlotDirective(SlotDirective{PVLimitW: 0})
+	st.SupportsPVCurtail = map[string]bool{"sungrow": true}
+	store := telemetry.NewStore()
+	emitPV(t, store, "easee", -1000)
+
+	st.SetPVManualHold(PVManualHold{
+		Driver:    "easee",
+		LimitW:    500,
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+
+	if got := ComputePVCurtail(st, store); got != nil {
+		t.Errorf("unsupported driver should be skipped, got %+v", got)
+	}
+}
+
 func abs(x float64) float64 {
 	if x < 0 {
 		return -x

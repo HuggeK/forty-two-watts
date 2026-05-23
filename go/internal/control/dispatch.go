@@ -378,6 +378,15 @@ type State struct {
 	// State; no internal mutex.
 	ManualHold BatteryManualHold
 
+	// ManualPVHold pins a PV curtail cap for a bounded duration,
+	// overriding whatever the planner's slot directive says about
+	// PVLimitW. Driver=="" applies at the site-aggregate level
+	// (split proportionally across drivers in SupportsPVCurtail by
+	// live |PV|); Driver=="<name>" caps only that one driver and
+	// leaves the rest uncapped. Hot-installed via POST
+	// /api/pv/manual_hold; auto-expires. Zero ExpiresAt means inactive.
+	ManualPVHold PVManualHold
+
 	// SettlementAwareSelfConsumption lets self_consumption look at the
 	// running net Wh inside the current fixed 15-minute settlement window
 	// (00/15/30/45) and bias the live grid target negative when the slot
@@ -429,6 +438,53 @@ func (s *State) GetBatteryManualHold(now time.Time) (BatteryManualHold, bool) {
 		return BatteryManualHold{}, false
 	}
 	return s.ManualHold, true
+}
+
+// PVManualHold is an operator-installed PV curtail override. See
+// State.ManualPVHold for invariants.
+//
+//   - Driver=="" → site-aggregate cap; ComputePVCurtail splits LimitW
+//     across SupportsPVCurtail drivers proportionally to their live |PV|.
+//   - Driver=="<name>" → caps only that driver; other PV-curtail
+//     drivers are left uncapped (and released if they were capped
+//     under the planner directive on the previous tick).
+//
+// LimitW is the absolute cap in watts (≥ 0). 0 W means "force PV off"
+// for the scoped surface — useful for verifying that the curtail action
+// reaches the inverter at all.
+type PVManualHold struct {
+	Driver    string
+	LimitW    float64
+	ExpiresAt time.Time
+}
+
+// SetPVManualHold installs a PV curtail override. Caller must hold the
+// outer ctrlMu. Zero ExpiresAt clears any active hold.
+func (s *State) SetPVManualHold(h PVManualHold) {
+	if h.ExpiresAt.IsZero() {
+		s.ManualPVHold = PVManualHold{}
+		return
+	}
+	s.ManualPVHold = h
+}
+
+// ClearPVManualHold removes any active PV hold. Caller must hold the
+// outer ctrlMu. Idempotent.
+func (s *State) ClearPVManualHold() {
+	s.ManualPVHold = PVManualHold{}
+}
+
+// GetPVManualHold returns the active PV hold for `now`, lazily
+// evicting an expired one. Caller must hold the outer ctrlMu.
+func (s *State) GetPVManualHold(now time.Time) (PVManualHold, bool) {
+	if s.ManualPVHold.ExpiresAt.IsZero() {
+		return PVManualHold{}, false
+	}
+	if !now.Before(s.ManualPVHold.ExpiresAt) {
+		s.ManualPVHold = PVManualHold{}
+		return PVManualHold{}, false
+	}
+	return s.ManualPVHold, true
 }
 
 func resetEnergyDispatchBookkeeping(state *State) {
@@ -1704,48 +1760,74 @@ func ComputePVCurtail(state *State, store *telemetry.Store) []CurtailTarget {
 	if state == nil {
 		return nil
 	}
-	// Fetch the active slot directly — independent of dispatch mode,
-	// because curtailment is an economic decision that applies in
-	// any mode the operator picked. The plan's `annotateCurtailment`
-	// already gated PVLimitW on negative export revenue.
+
+	now := time.Now()
+
+	// Operator-installed manual hold takes precedence over the planner
+	// directive. Driver-scoped → cap only that driver. Site-aggregate
+	// (Driver=="") → use LimitW as the site-wide cap and fall into the
+	// same proportional allocation the planner path uses.
+	hold, holdActive := state.GetPVManualHold(now)
+	scopedDriver := ""
+
 	var limit float64
-	if state.SlotDirective != nil {
-		if dir, ok := state.SlotDirective(time.Now()); ok {
+	if holdActive {
+		limit = hold.LimitW
+		scopedDriver = hold.Driver
+	} else if state.SlotDirective != nil {
+		// Fetch the active slot directly — independent of dispatch mode,
+		// because curtailment is an economic decision that applies in
+		// any mode the operator picked. The plan's `annotateCurtailment`
+		// already gated PVLimitW on negative export revenue.
+		if dir, ok := state.SlotDirective(now); ok {
 			limit = dir.PVLimitW
 		}
 	}
 
-	// Decide which drivers should be curtailed this tick.
+	// Decide which drivers should be curtailed this tick. A hold with
+	// LimitW == 0 is still a valid cap (force PV off on the scoped
+	// surface) — only release entirely when there is no active hold AND
+	// the planner isn't asking for curtail.
 	next := map[string]float64{}
-	if limit > 0 && store != nil && len(state.SupportsPVCurtail) > 0 {
-		// Allocate the site-wide limit proportionally to each PV-
-		// supporting driver's live |PV|. A driver currently producing
-		// nothing gets nothing (no point asking it to cap output it
-		// isn't producing).
-		type pvD struct {
-			name string
-			abs  float64
-		}
-		var drivers []pvD
-		var total float64
-		for _, r := range store.ReadingsByType(telemetry.DerPV) {
-			h := store.DriverHealth(r.Driver)
-			if h == nil || !h.IsOnline() {
-				continue
+	wantCurtail := holdActive || limit > 0
+	if wantCurtail && store != nil && len(state.SupportsPVCurtail) > 0 {
+		if scopedDriver != "" {
+			// Driver-scoped hold: cap that one driver only, regardless
+			// of its live |PV| (operator may want to force a verified-
+			// off check even when the inverter is producing nothing).
+			if state.SupportsPVCurtail[scopedDriver] {
+				next[scopedDriver] = limit
 			}
-			if !state.SupportsPVCurtail[r.Driver] {
-				continue
+		} else {
+			// Allocate the site-wide limit proportionally to each PV-
+			// supporting driver's live |PV|. A driver currently producing
+			// nothing gets nothing (no point asking it to cap output it
+			// isn't producing).
+			type pvD struct {
+				name string
+				abs  float64
 			}
-			if r.RawW >= 0 {
-				continue // not generating right now
+			var drivers []pvD
+			var total float64
+			for _, r := range store.ReadingsByType(telemetry.DerPV) {
+				h := store.DriverHealth(r.Driver)
+				if h == nil || !h.IsOnline() {
+					continue
+				}
+				if !state.SupportsPVCurtail[r.Driver] {
+					continue
+				}
+				if r.RawW >= 0 {
+					continue // not generating right now
+				}
+				abs := -r.RawW
+				drivers = append(drivers, pvD{name: r.Driver, abs: abs})
+				total += abs
 			}
-			abs := -r.RawW
-			drivers = append(drivers, pvD{name: r.Driver, abs: abs})
-			total += abs
-		}
-		if total > 0 {
-			for _, d := range drivers {
-				next[d.name] = limit * (d.abs / total)
+			if total > 0 {
+				for _, d := range drivers {
+					next[d.name] = limit * (d.abs / total)
+				}
 			}
 		}
 	}
