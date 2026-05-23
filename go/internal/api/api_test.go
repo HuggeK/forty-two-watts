@@ -1,7 +1,11 @@
 package api
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -9,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/frahlg/forty-two-watts/go/internal/config"
 	"github.com/frahlg/forty-two-watts/go/internal/state"
 	"github.com/frahlg/forty-two-watts/go/internal/telemetry"
 )
@@ -102,6 +107,85 @@ func TestHandleEVStatusRejectsUnknownDriver(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("unknown driver: got %d, want 404 (body: %s)", rr.Code, rr.Body.String())
 	}
+}
+
+func TestLoadResearchDumpExportsHouseLoadWithEVSplit(t *testing.T) {
+	st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	ts := now.Add(-time.Hour).UnixMilli()
+	js := `{"drivers":{"charger":{"ev_w":300}}}`
+	if err := st.RecordHistory(state.HistoryPoint{
+		TsMs:   ts,
+		GridW:  1300,
+		PVW:    -500,
+		BatW:   0,
+		LoadW:  1800, // legacy whole-site load: grid - bat - pv
+		BatSoC: 55,
+		JSON:   js,
+	}); err != nil {
+		t.Fatalf("record history: %v", err)
+	}
+
+	cfg := &config.Config{
+		Fuse:       config.Fuse{MaxAmps: 16, Phases: 3, Voltage: 230},
+		Price:      &config.Price{Provider: "none", Zone: "SE3"},
+		Loadpoints: []config.Loadpoint{{ID: "ev", DriverName: "charger"}},
+	}
+	srv := New(&Deps{State: st, Cfg: cfg, Version: "test"})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/research/load/dump?days=1", nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("got status %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+
+	files := readTarGz(t, rr.Body.Bytes())
+	csv := string(files["timeseries_15m.csv"])
+	if !strings.Contains(csv, ",300,1500,1800,") {
+		t.Fatalf("timeseries does not carry ev_w=300, house_load_w=1500, recorded_load_w=1800:\n%s", csv)
+	}
+	siteJSON := string(files["site.json"])
+	if !strings.Contains(siteJSON, `"has_ev": true`) {
+		t.Fatalf("site.json does not mark EV presence:\n%s", siteJSON)
+	}
+}
+
+func readTarGz(t *testing.T, body []byte) map[string][]byte {
+	t.Helper()
+	gz, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	files := map[string][]byte{}
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read %s: %v", hdr.Name, err)
+		}
+		parts := strings.SplitN(hdr.Name, "/", 2)
+		if len(parts) == 2 {
+			files[parts[1]] = b
+		}
+	}
+	return files
 }
 
 // With no state backing, /api/energy/daily returns an empty payload at

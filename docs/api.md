@@ -661,13 +661,45 @@ Handler: `go/internal/api/api.go:830`
 
 ### POST /api/loadmodel/reset
 
-Clear the load twin. Same semantics as `/api/pvmodel/reset`
+Clear the load twin while preserving the configured
+`heating_w_per_degc`. Same semantics as `/api/pvmodel/reset`.
 
 **Response (200):** `{ "status": "reset" }`
 
 **Errors:** `400` `{ "error": "loadmodel disabled" }`
 
 Handler: `go/internal/api/api.go:856`
+
+### GET /api/research/load/dump
+
+Download an explicit opt-in load-research bundle as a gzipped tarball.
+The bundle contains no raw config, logs, hostnames, driver names, device
+serials, or endpoints. It is intended for offline model analysis across
+real installations.
+
+**Query params:**
+
+- `days` — history window in days, `1..365`, default `120`.
+
+**Contents:**
+
+- `manifest.json` — format version, generated timestamp, stable random
+  research `site_id`, window, bucket size, privacy statement, and load
+  sign convention.
+- `site.json` — non-identifying site shape: fuse size, price zone,
+  provider names, total battery capacity, PV rated W, loadpoint count,
+  EV presence, and heating coefficient.
+- `timeseries_15m.csv` — 15-minute aggregates:
+  `grid_w,pv_w,bat_w,ev_w,house_load_w,recorded_load_w,bat_soc,temp_c,cloud_pct,total_ore_kwh,spot_ore_kwh`.
+- `loadmodel_state.json` — current load twin state, or `{}` if disabled.
+
+`house_load_w = max(grid_w - pv_w - bat_w - ev_w, 0)` using the site sign
+convention. `recorded_load_w` is included separately so older bundles can
+be audited across changes in history semantics.
+
+**Response (200):** `application/gzip`
+
+**Errors:** `400` invalid `days`, `503` state store unavailable.
 
 ---
 

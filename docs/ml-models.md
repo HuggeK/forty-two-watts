@@ -156,9 +156,11 @@ only (`model.go:167`).
 
 ### Inputs and outputs
 
-- **Inputs**: derived measured load `grid_w − pv_w − bat_w` (site sign)
-  pulled from `telemetry.Store` once per 60 s; outdoor temperature from
-  the forecast (`TempFunc`). Negative loads are treated as PI-step
+- **Inputs**: derived measured house load
+  `grid_w − pv_w − bat_w − ev_w` (site sign) pulled from online
+  `telemetry.Store` readings once per 60 s; outdoor temperature from the
+  forecast (`TempFunc`). EV is subtracted so car charging does not train
+  the household weekly pattern. Negative loads are treated as PI-step
   transients and skipped (`service.go:144`).
 - **Outputs**: `Predict(t)` returns expected load W at any future
   timestamp. MPC `buildSlots` passes it directly as `LoadW` (already
@@ -178,9 +180,10 @@ curve.
 
 ### Persistence + reset
 
-- Config key: `loadmodel/state` (`service.go:19`).
+- Config key: `loadmodel/state_utc` (`service.go:19`).
 - `POST /api/loadmodel/reset` (`go/internal/api/api.go:122`) — reseeds
-  via `NewModel(peakW)` while preserving the configured peak.
+  via `NewModel(peakW)` while preserving the configured peak and heating
+  coefficient.
 
 ---
 

@@ -269,6 +269,7 @@
       '    </div>' +
       '    <div class="ftw-diag-actions">' +
       '      <button class="ftw-diag-btn" data-role="dump" title="Download a gzipped tarball with recent logs, redacted config, driver health, and 1 h of telemetry — small enough to email a developer.">Download recent logs</button>' +
+      '      <button class="ftw-diag-btn" data-role="research" title="Download an anonymized 120-day load research bundle with 15-minute site aggregates, EV split out, weather, prices, and load-model state.">Download load research</button>' +
       '      <button class="ftw-diag-close" data-role="close" aria-label="Close">×</button>' +
       '    </div>' +
       '  </div>' +
@@ -287,6 +288,9 @@
     backdrop.querySelector('[data-role="close"]').addEventListener("click", close);
     backdrop.querySelector('[data-role="dump"]').addEventListener("click", function () {
       window.location.href = "/api/support/dump";
+    });
+    backdrop.querySelector('[data-role="research"]').addEventListener("click", function () {
+      window.location.href = "/api/research/load/dump?days=120";
     });
 
     state.keyHandler = function (ev) { if (ev.key === "Escape") close(); };

@@ -22,23 +22,23 @@ import (
 	"time"
 
 	"github.com/frahlg/forty-two-watts/go/internal/api"
+	"github.com/frahlg/forty-two-watts/go/internal/arp"
 	"github.com/frahlg/forty-two-watts/go/internal/battery"
 	"github.com/frahlg/forty-two-watts/go/internal/config"
 	"github.com/frahlg/forty-two-watts/go/internal/configreload"
 	"github.com/frahlg/forty-two-watts/go/internal/control"
 	"github.com/frahlg/forty-two-watts/go/internal/currency"
-	"github.com/frahlg/forty-two-watts/go/internal/events"
-	"github.com/frahlg/forty-two-watts/go/internal/notifications"
-	"github.com/frahlg/forty-two-watts/go/internal/arp"
 	"github.com/frahlg/forty-two-watts/go/internal/devtools"
 	"github.com/frahlg/forty-two-watts/go/internal/drivers"
+	"github.com/frahlg/forty-two-watts/go/internal/events"
 	"github.com/frahlg/forty-two-watts/go/internal/forecast"
 	"github.com/frahlg/forty-two-watts/go/internal/ha"
 	"github.com/frahlg/forty-two-watts/go/internal/loadmodel"
 	"github.com/frahlg/forty-two-watts/go/internal/loadpoint"
-	mqttcli "github.com/frahlg/forty-two-watts/go/internal/mqtt"
 	modbuscli "github.com/frahlg/forty-two-watts/go/internal/modbus"
 	"github.com/frahlg/forty-two-watts/go/internal/mpc"
+	mqttcli "github.com/frahlg/forty-two-watts/go/internal/mqtt"
+	"github.com/frahlg/forty-two-watts/go/internal/notifications"
 	"github.com/frahlg/forty-two-watts/go/internal/nova"
 	"github.com/frahlg/forty-two-watts/go/internal/ocpp"
 	"github.com/frahlg/forty-two-watts/go/internal/priceforecast"
@@ -127,8 +127,12 @@ func main() {
 	statePath := "state.db"
 	coldDir := "cold"
 	if cfg.State != nil {
-		if cfg.State.Path != "" { statePath = cfg.State.Path }
-		if cfg.State.ColdDir != "" { coldDir = cfg.State.ColdDir }
+		if cfg.State.Path != "" {
+			statePath = cfg.State.Path
+		}
+		if cfg.State.ColdDir != "" {
+			coldDir = cfg.State.ColdDir
+		}
 	}
 	st, err := state.Open(statePath)
 	if err != nil {
@@ -415,7 +419,9 @@ func main() {
 			// update. Rebinding the local variable would orphan the
 			// reference the api server still holds.
 			capMu.Lock()
-			for k := range capacities { delete(capacities, k) }
+			for k := range capacities {
+				delete(capacities, k)
+			}
 			for k, v := range driverCapacitiesFrom(newCfg.Drivers, newCfg.Loadpoints) {
 				capacities[k] = v
 			}
@@ -648,13 +654,10 @@ func main() {
 		loadPeakW = 5000
 	}
 	loadSvc := loadmodel.NewService(st, tel, cfg.SiteMeterDriver(), loadPeakW)
-	if cfg.Weather != nil && cfg.Weather.HeatingWPerDegC > 0 {
-		m := loadSvc.Model()
-		m.HeatingW_per_degC = cfg.Weather.HeatingWPerDegC
-		// Apply without persisting raw overwrite — model is behind a sync,
-		// so use the exposed setter. Simpler: push via reset+restore.
-		// Just update the live field directly through a small helper.
+	if cfg.Weather != nil {
 		loadSvc.SetHeatingCoef(cfg.Weather.HeatingWPerDegC)
+	} else {
+		loadSvc.SetHeatingCoef(0)
 	}
 	// Temperature source for heating-gain fit: same forecast cache.
 	loadSvc.Temp = func(t time.Time) (float64, bool) {
@@ -1317,12 +1320,12 @@ func main() {
 		State: st,
 		CapMu: capMu, Capacities: capacities,
 		CfgMu: cfgMu, Cfg: cfg, ConfigPath: *configPath,
-		DriverDir: resolveDriverDir(),
+		DriverDir:           resolveDriverDir(),
 		DriverMQTTFactory:   reg.MQTTFactory,
 		DriverModbusFactory: reg.ModbusFactory,
 		DriverARPLookup:     reg.ARPLookup,
-		Models: models, ModelsMu: modelsMu,
-		SelfTune: selfTune,
+		Models:              models, ModelsMu: modelsMu,
+		SelfTune:   selfTune,
 		DtS:        float64(cfg.Site.ControlIntervalS),
 		SaveConfig: config.SaveAtomic,
 		WebDir:     *webDir,
@@ -1332,19 +1335,19 @@ func main() {
 		// from the state.db path rather than the config path because
 		// `state.db` is always in the main data volume; the config
 		// can legitimately live elsewhere (e.g. mounted RO from /etc).
-		SnapshotDir: filepath.Join(filepath.Dir(statePath), "snapshots"),
-		Prices:     priceSvc,
-		Forecast:   forecastSvc,
-		MPC:        mpcSvc,
-		PVModel:    pvSvc,
-		LoadModel:  loadSvc,
+		SnapshotDir:   filepath.Join(filepath.Dir(statePath), "snapshots"),
+		Prices:        priceSvc,
+		Forecast:      forecastSvc,
+		MPC:           mpcSvc,
+		PVModel:       pvSvc,
+		LoadModel:     loadSvc,
 		Loadpoints:    lpMgr,
 		LoadpointCtrl: lpController,
 		HA:            haBridge,
-		Registry:   reg,
-		Events:     bus,
+		Registry:      reg,
+		Events:        bus,
 		Notifications: notifSvc,
-		SelfUpdate: selfUpdater,
+		SelfUpdate:    selfUpdater,
 		Restart: func(reqCtx context.Context) error {
 			// Prefer the docker-compose sidecar path when wired up: the
 			// updater container does docker compose up -d --force-recreate,
@@ -1369,7 +1372,7 @@ func main() {
 			})
 			return nil
 		},
-		Version:    Version,
+		Version: Version,
 	}
 	srv := api.New(deps)
 	// Dev-mode proxy: when FTW_PROXY_UPSTREAM is set (e.g.
@@ -1608,11 +1611,17 @@ func main() {
 				ctrlMu.Unlock()
 				for _, t := range lastTargets {
 					r := tel.Get(t.Driver, telemetry.DerBattery)
-					if r == nil { continue }
+					if r == nil {
+						continue
+					}
 					m, ok := models[t.Driver]
-					if !ok { continue }
+					if !ok {
+						continue
+					}
 					soc := 0.5
-					if r.SoC != nil { soc = *r.SoC }
+					if r.SoC != nil {
+						soc = *r.SoC
+					}
 					m.Update(t.TargetW, r.SmoothedW, soc, dtS, nowMs)
 				}
 				modelsMu.Unlock()
@@ -1623,9 +1632,13 @@ func main() {
 				modelsMu.Lock()
 				selfTune.Tick(func(name string) (float64, float64, bool) {
 					r := tel.Get(name, telemetry.DerBattery)
-					if r == nil { return 0, 0, false }
+					if r == nil {
+						return 0, 0, false
+					}
 					soc := 0.5
-					if r.SoC != nil { soc = *r.SoC }
+					if r.SoC != nil {
+						soc = *r.SoC
+					}
 					return r.SmoothedW, soc, true
 				}, models, dtS, nowMs)
 				modelsMu.Unlock()
@@ -1633,7 +1646,9 @@ func main() {
 
 			// ---- Watchdog: mark stale drivers offline, revert them to autonomous ----
 			watchdogTimeout := time.Duration(cfg.Site.WatchdogTimeoutS) * time.Second
-			if watchdogTimeout <= 0 { watchdogTimeout = 60 * time.Second }
+			if watchdogTimeout <= 0 {
+				watchdogTimeout = 60 * time.Second
+			}
 			for _, tr := range tel.WatchdogScan(watchdogTimeout) {
 				if !tr.Online {
 					slog.Warn("driver telemetry stale — marking offline + reverting to autonomous",
@@ -1704,7 +1719,9 @@ func main() {
 			// ---- Compute dispatch ----
 			capMu.RLock()
 			capsSnap := make(map[string]float64, len(capacities))
-			for k, v := range capacities { capsSnap[k] = v }
+			for k, v := range capacities {
+				capsSnap[k] = v
+			}
 			capMu.RUnlock()
 
 			// Surplus-only EV reserve: aggregate PV headroom to leave
@@ -1838,8 +1855,8 @@ func main() {
 				for name, m := range models {
 					if data, err := json.Marshal(m); err == nil {
 						if err := st.SaveBatteryModel(name, string(data)); err != nil {
-						slog.Warn("failed to persist battery model", "battery", name, "err", err)
-					}
+							slog.Warn("failed to persist battery model", "battery", name, "err", err)
+						}
 					}
 				}
 				modelsMu.Unlock()
@@ -1858,8 +1875,10 @@ func rolloffLoop(ctx context.Context, st *state.Store, coldDir string) {
 	doRolloff(ctx, st, coldDir)
 	for {
 		select {
-		case <-ctx.Done(): return
-		case <-tick.C: doRolloff(ctx, st, coldDir)
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			doRolloff(ctx, st, coldDir)
 		}
 	}
 }
@@ -1894,7 +1913,9 @@ func doRolloff(ctx context.Context, st *state.Store, coldDir string) {
 func registerAllDevices(st *state.Store, reg *drivers.Registry) {
 	for _, name := range reg.Names() {
 		env := reg.Env(name)
-		if env == nil { continue }
+		if env == nil {
+			continue
+		}
 		make, sn, mac, ep := env.FullIdentity()
 		dev := state.Device{
 			DriverName: name,
@@ -2276,7 +2297,9 @@ func recordHistory(st *state.Store, tel *telemetry.Store, ctrl *control.State, n
 	}
 	var pvW, batW, sumSoC float64
 	var socCount int
-	for _, r := range tel.ReadingsByType(telemetry.DerPV) { pvW += r.SmoothedW }
+	for _, r := range tel.ReadingsByType(telemetry.DerPV) {
+		pvW += r.SmoothedW
+	}
 	for _, r := range tel.ReadingsByType(telemetry.DerBattery) {
 		batW += r.SmoothedW
 		if r.SoC != nil {
@@ -2285,9 +2308,14 @@ func recordHistory(st *state.Store, tel *telemetry.Store, ctrl *control.State, n
 		}
 	}
 	avgSoC := 0.0
-	if socCount > 0 { avgSoC = sumSoC / float64(socCount) }
-	loadW := gridW - batW - pvW
-	if loadW < 0 { loadW = 0 }
+	if socCount > 0 {
+		avgSoC = sumSoC / float64(socCount)
+	}
+	evW := tel.SumOnlineEVW()
+	loadW := gridW - batW - pvW - evW
+	if loadW < 0 {
+		loadW = 0
+	}
 
 	// Per-driver detail packed into the JSON column. The schema is
 	// schema-less by design — UI code reads what it understands and
@@ -2297,7 +2325,9 @@ func recordHistory(st *state.Store, tel *telemetry.Store, ctrl *control.State, n
 		row := map[string]float64{}
 		if r := tel.Get(name, telemetry.DerBattery); r != nil {
 			row["bat_w"] = r.SmoothedW
-			if r.SoC != nil { row["soc"] = *r.SoC }
+			if r.SoC != nil {
+				row["soc"] = *r.SoC
+			}
 		}
 		if r := tel.Get(name, telemetry.DerPV); r != nil {
 			row["pv_w"] = r.SmoothedW
@@ -2321,8 +2351,10 @@ func recordHistory(st *state.Store, tel *telemetry.Store, ctrl *control.State, n
 		targets[t.Driver] = t.TargetW
 	}
 	jsonBlob, _ := json.Marshal(map[string]any{
-		"drivers": perDriver,
-		"targets": targets,
+		"drivers":      perDriver,
+		"targets":      targets,
+		"ev_w":         evW,
+		"load_house_w": loadW,
 	})
 	if err := st.RecordHistory(state.HistoryPoint{
 		TsMs: nowMs, GridW: gridW, PVW: pvW, BatW: batW, LoadW: loadW, BatSoC: avgSoC,

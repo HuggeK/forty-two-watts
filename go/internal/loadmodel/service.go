@@ -126,6 +126,14 @@ func (s *Service) loop(ctx context.Context) {
 	}
 }
 
+func (s *Service) driverOnline(name string) bool {
+	if s == nil || s.Tele == nil {
+		return false
+	}
+	h := s.Tele.DriverHealth(name)
+	return h != nil && h.IsOnline()
+}
+
 // sample computes measured house load = grid_w − pv_w − bat_w − ev_w
 // and feeds it to the model. Skips when drivers haven't settled yet
 // (no site meter reading). EV is subtracted so the weekly-pattern
@@ -133,18 +141,31 @@ func (s *Service) loop(ctx context.Context) {
 // car session" — otherwise every Monday-evening bucket inflates when
 // the driver happens to plug in after work.
 func (s *Service) sample() {
-	now := time.Now()
+	s.sampleAt(time.Now())
+}
+
+func (s *Service) sampleAt(now time.Time) {
 	meter := s.Tele.Get(s.SiteMeter, telemetry.DerMeter)
 	if meter == nil {
 		slog.Debug("loadmodel: skip (no site meter yet)")
 		return
 	}
+	if !s.driverOnline(s.SiteMeter) {
+		slog.Debug("loadmodel: skip (site meter offline)", "driver", s.SiteMeter)
+		return
+	}
 	gridW := meter.SmoothedW
 	var pvW, batW float64
 	for _, r := range s.Tele.ReadingsByType(telemetry.DerPV) {
+		if !s.driverOnline(r.Driver) {
+			continue
+		}
 		pvW += r.SmoothedW // site-sign: negative = generating
 	}
 	for _, r := range s.Tele.ReadingsByType(telemetry.DerBattery) {
+		if !s.driverOnline(r.Driver) {
+			continue
+		}
 		batW += r.SmoothedW // site-sign: positive = charging
 	}
 	evW := s.Tele.SumOnlineEVW() // online-only so stale readings don't poison load
@@ -212,7 +233,9 @@ func (s *Service) Reset() {
 	}
 	s.mu.Lock()
 	peak := s.model.PeakW
+	heating := s.model.HeatingW_per_degC
 	s.model = NewModel(peak)
+	s.model.HeatingW_per_degC = heating
 	s.mu.Unlock()
 	s.persist()
 }
