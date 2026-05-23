@@ -1276,7 +1276,9 @@
       windowEnd: windowEnd, totalMs: totalMs, now: now,
       plan: chartPlan,
       series: series,
-      pointCount: chartHistory.timestamps.length
+      pointCount: chartHistory.timestamps.length,
+      fontTooltip: chartFontTooltip,
+      fontTooltipS: chartFontTooltipS
     };
 
     if (hoverIndex >= 0 && hoverIndex < chartLayout.pointCount) {
@@ -1300,6 +1302,8 @@
     if (!chartLayout) return;
     var l = chartLayout;
     var i = hoverIndex;
+    var fontTooltip = l.fontTooltip || "10px monospace";
+    var fontTooltipS = l.fontTooltipS || "9px monospace";
     // Map by timestamp (matches the time-anchored line drawing)
     var ts = chartHistory.timestamps[i];
     if (ts == null) return;
@@ -1370,7 +1374,7 @@
     ctx.fillRect(boxX, boxY, boxW, boxH);
     ctx.strokeRect(boxX, boxY, boxW, boxH);
 
-    ctx.font = chartFontTooltip;
+    ctx.font = fontTooltip;
     ctx.fillStyle = "#888";
     ctx.fillText(timeStr, boxX + 6, boxY + lineHeight - 2);
 
@@ -1394,9 +1398,9 @@
         if (lab.target && i < lab.target.length && Math.abs(lab.target[i]) > 1) {
           var actualW = ctx.measureText(actual).width;
           ctx.fillStyle = "#888";
-          ctx.font = chartFontTooltipS;
+          ctx.font = fontTooltipS;
           ctx.fillText("→ " + formatW(lab.target[i]), boxX + boxW - 10 - actualW, y);
-          ctx.font = chartFontTooltip;
+          ctx.font = fontTooltip;
         }
       }
       ctx.textAlign = "left";
@@ -1408,6 +1412,7 @@
     var l = chartLayout;
     var a = hoverForecast.action;
     var ts = hoverForecast.ts;
+    var fontTooltip = l.fontTooltip || "10px monospace";
     var x = l.pad.left + l.plotW * (ts - l.windowStart) / l.totalMs;
 
     // Vertical line
@@ -1443,7 +1448,7 @@
     ctx.fillRect(boxX, boxY, boxW, boxH);
     ctx.strokeRect(boxX, boxY, boxW, boxH);
 
-    ctx.font = chartFontTooltip;
+    ctx.font = fontTooltip;
     var d = new Date(ts);
     var hh = d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0");
     ctx.fillStyle = "#fbbf24";
