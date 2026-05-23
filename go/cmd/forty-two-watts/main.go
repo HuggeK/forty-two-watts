@@ -2314,7 +2314,22 @@ func buildMPC(cfg *config.Config, st *state.Store, tel *telemetry.Store, capacit
 		SoCMinPct:           socMin,
 		SoCMaxPct:           socMax,
 		InitialSoCPct:       50,
-		ActionLevels:        21,
+		// ActionLevels = 41 → 450 W discretization step on a ±9 kW
+		// action range. ActionLevels=21 (900 W step) was too coarse:
+		// on borderline days where the planner needed to absorb a
+		// 1700 W net PV surplus into the battery, the closest legal
+		// charge action was +900 W (next step +1800 W pushed grid
+		// past zero and got blocked by ModeSelfConsumption's no-
+		// battery-export rule). The marginal benefit of +900 over 0
+		// then sometimes wasn't enough to overcome action-grid noise
+		// over a 48 h horizon, so the DP picked idle/export — leaking
+		// 1.7 kW of cheap midday PV to grid while SoC sat well below
+		// SoCMaxPct. 41 levels closes the gap to 450 W steps so the
+		// DP can land on a charge target within ~225 W of the
+		// optimum. DP complexity is O(N×S×A×EL×EA) — at the production
+		// 192-slot × 41-SoC × 1-EV grid, doubling A goes from 165k
+		// to 330k evaluations, still well under 10 ms.
+		ActionLevels:        41,
 		MaxChargeW:          maxChg,
 		MaxDischargeW:       maxDis,
 		ChargeEfficiency:    chgEff,
