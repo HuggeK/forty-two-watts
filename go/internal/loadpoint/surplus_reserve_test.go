@@ -29,11 +29,19 @@ func TestSurplusReserveW(t *testing.T) {
 			want: 2500 + EVRampHeadroomW,
 		},
 		{
-			name: "EV at 0W with 11kW max → just the headroom",
+			// Updated 2026-05: when EV is plugged but not actually
+			// drawing, no reserve. The 2 kW idle headroom otherwise
+			// hangs around for a Tesla that's Complete / a vehicle
+			// driver that went offline / a car refusing the offer,
+			// blocking the home battery from absorbing PV. Wake-kick
+			// path (controller.tickOne) materialises EV draw to
+			// >50 W within a tick if the EV is actually going to
+			// start, at which point the reserve re-engages.
+			name: "EV at 0W → no reserve (not drawing)",
 			states: []State{
 				{SurplusOnly: true, PluggedIn: true, CurrentPowerW: 0, MaxChargeW: 11000},
 			},
-			want: EVRampHeadroomW,
+			want: 0,
 		},
 		{
 			name: "EV close to max → clamped to MaxChargeW (no overshoot)",
@@ -50,12 +58,12 @@ func TestSurplusReserveW(t *testing.T) {
 			want: 11000,
 		},
 		{
-			name: "multiple LPs sum",
+			name: "multiple LPs sum — only active ones contribute",
 			states: []State{
 				{SurplusOnly: true, PluggedIn: true, CurrentPowerW: 1500, MaxChargeW: 3700}, // 1500 + 2000 = 3500, under cap
-				{SurplusOnly: true, PluggedIn: true, CurrentPowerW: 0, MaxChargeW: 11000},   // 0 + 2000 = 2000
+				{SurplusOnly: true, PluggedIn: true, CurrentPowerW: 0, MaxChargeW: 11000},   // not drawing → 0
 			},
-			want: (1500 + EVRampHeadroomW) + (0 + EVRampHeadroomW),
+			want: 1500 + EVRampHeadroomW,
 		},
 	}
 	for _, tt := range tests {

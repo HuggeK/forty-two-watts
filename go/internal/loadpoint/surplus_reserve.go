@@ -40,17 +40,21 @@ func SurplusReserveW(states []State) float64 {
 		if !st.SurplusOnly || !st.PluggedIn {
 			continue
 		}
-		// Skip the reserve when the vehicle is in a terminal non-drawing
-		// state. "Complete" means the car reached its SoC target and
-		// won't draw more without operator intervention (re-target via
-		// app, plug-cycle, force_start). Leaving 2 kW reserved for a car
-		// that's refusing the offer makes the home battery hold steady
-		// at the current SoC while the same 2 kW exports to grid — the
-		// "charging a bit but not full surplus" symptom from a session
-		// where the EV finished charging mid-afternoon. Other states
-		// ("Stopped", "Disconnected", empty) keep the reserve so the
-		// system can bootstrap a re-start.
-		if st.VehicleChargingState == "Complete" {
+		// Tie the reserve to the EV's ACTUAL draw, not just "plugged in
+		// + surplus_only". A car that's Complete, refusing the offer,
+		// or whose vehicle driver has gone offline (Tesla proxy flake
+		// etc.) reports CurrentPowerW≈0 — leaving 2 kW reserved for it
+		// makes the home battery hold steady at SoC while the same
+		// 2 kW exports to grid. The wake-kick path (controller.tickOne)
+		// commands cmd_w = min-step (1380 W) during the kick window,
+		// which materialises as CurrentPowerW>50 W within one tick if
+		// the EV is actually going to start — at which point this
+		// reserve activates and the battery makes room.
+		//
+		// Threshold 50 W picks up any non-trivial draw while ignoring
+		// idle pilot / standby consumption that doesn't represent
+		// "EV is actively claiming surplus".
+		if st.CurrentPowerW < 50.0 {
 			continue
 		}
 		ceiling := st.CurrentPowerW + EVRampHeadroomW
