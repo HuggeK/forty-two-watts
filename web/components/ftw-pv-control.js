@@ -7,7 +7,8 @@
 // trigger a negative-price slot.
 //
 // Talks to /api/pv/manual_hold (POST/GET/DELETE). The backend resolves
-// limit_pct → watts using live |PV| when needed, and only accepts
+// limit_pct → watts against the driver's configured nominal_w
+// (rated inverter AC output), falling back to live |PV| only when
 // driver scopes that advertise pv-curtail in the catalog.
 //
 // Usage:
@@ -226,7 +227,7 @@ class FtwPvControl extends FtwElement {
         </div>
 
         <div class="row" data-controls-row data-pct-row>
-          <label class="label" for="pct-input">Limit (% of live PV)</label>
+          <label class="label" for="pct-input">Limit (% of inverter max)</label>
           <div class="power-wrap">
             <input data-pct-input type="number" min="0" max="100" step="5" value="50" inputmode="numeric"/>
             <span class="unit">%</span>
