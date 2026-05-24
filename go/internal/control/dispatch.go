@@ -1485,6 +1485,17 @@ func ComputeDispatch(
 		if !hasAnchor {
 			continue
 		}
+		// Planned PV-export slots are explicitly trying to stop battery
+		// motion and let the surplus cross the meter. Slew-limiting that
+		// stop keeps a charging battery absorbing PV for multiple control
+		// cycles, which visibly violates the smart self-consumption plan.
+		// A direct move to 0 W is safe here: it only removes battery load /
+		// discharge, and the fuse overflow guard below can still force
+		// discharge if the site actually needs it.
+		if plannerSelfExportSurplusGate && math.Abs(raw[i].TargetW) < 1 {
+			raw[i].TargetW = 0
+			continue
+		}
 		delta := raw[i].TargetW - anchor
 		if math.Abs(delta) > state.SlewRateW {
 			sign := 1.0

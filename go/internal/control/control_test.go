@@ -1820,6 +1820,46 @@ func TestPlannerSelfPlannedPVExportDoesNotAbsorbLiveSurplus(t *testing.T) {
 	}
 }
 
+func TestPlannerSelfPlannedPVExportStopsChargingWithoutSlew(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{
+		SlotStart:       now,
+		SlotEnd:         now.Add(15 * time.Minute),
+		BatteryEnergyWh: 0,
+		Strategy:        "self_consumption",
+		PlannedGridW:    -6000,
+		HasPlannedGridW: true,
+	}
+	store := seedStore(-3300, []struct {
+		name          string
+		currentW, soc float64
+	}{
+		{"sungrow", 2000, 0.5},
+		{"ferroamp", 0, 0.5},
+	})
+	st := NewState(0, 0, "ferroamp")
+	st.Mode = ModePlannerSelf
+	st.UseEnergyDispatch = true
+	// Keep the default 500 W slew. The regression was target 1500 W:
+	// correct intent (0 W) slowed down by the slew limiter.
+	st.MinDispatchIntervalS = 0
+	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return dir, true }
+
+	targets := ComputeDispatch(store, st, caps(map[string]float64{
+		"sungrow":  10000,
+		"ferroamp": 14800,
+	}), 11040)
+	if len(targets) != 2 {
+		t.Fatalf("want 2 targets, got %d", len(targets))
+	}
+	for _, target := range targets {
+		if math.Abs(target.TargetW) > 1 {
+			t.Errorf("%s TargetW = %f W — planned PV-export slot should stop battery charge immediately despite slew",
+				target.Driver, target.TargetW)
+		}
+	}
+}
+
 // Plan says participate this slot (above idle threshold) and live grid is
 // importing. planner_self then behaves like classic self-consumption: the
 // battery may discharge to pull the site meter toward zero, but it does not
