@@ -97,6 +97,13 @@ func (g *gorillaWS) Open(url string, headers map[string]string) error {
 	g.conn = conn
 	g.open = true
 	g.stop = make(chan struct{})
+	// Drop any frames left over from a previous connection's lifetime.
+	// Without this the EOF sentinel ("") pushed by the *prior* read pump
+	// is delivered to the *new* connection's first PopMessages, the
+	// driver sees it as a fresh close, and tears the new socket down —
+	// turning a single Tibber server-side disconnect into an infinite
+	// reconnect/teardown loop that only ends on a process restart.
+	g.queue = nil
 	g.mu.Unlock()
 
 	go g.readPump()
