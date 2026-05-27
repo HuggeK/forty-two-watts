@@ -53,6 +53,13 @@ jobs:
           # which changesets have already been consumed by past
           # Version PRs (it walks .changeset/ vs CHANGELOG.md).
           fetch-depth: 0
+          # Use CI_TOKEN (PAT or GitHub App token) when available so
+          # the Version PR's push events trigger `test.yml` and
+          # `changeset-check.yml`. The default GITHUB_TOKEN suppresses
+          # cascading workflow runs on bot-authored pushes, which
+          # would leave the Version PR without required status checks
+          # under branch protection.
+          token: ${{ secrets.CI_TOKEN || secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
       - name: Setup Node
@@ -86,8 +93,21 @@ jobs:
           # easy to recognize in the PR list.
           title:  "chore(release): version packages"
           commit: "chore(release): version packages"
+          # Disable the action's built-in GitHub Release creation:
+          # our `publish` script already creates the release via
+          # `gh release create`. With this left at the default `true`
+          # the action would try to create a second release at the
+          # same tag, hit 422 "already_exists", throw uncaught, and
+          # leave `outputs.published` unset — silently skipping every
+          # downstream asset job. Cross-audit by codex + a fresh-
+          # context architect agent both flagged this as critical.
+          createGithubReleases: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same CI_TOKEN preference: pushing the Version PR branch
+          # with GITHUB_TOKEN suppresses workflow_run on bot pushes,
+          # leaving required checks unrun. CI_TOKEN (PAT / GH App)
+          # makes the push look like a user push so checks fire.
+          GITHUB_TOKEN: ${{ secrets.CI_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Read published version
         id: publish_meta

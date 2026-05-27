@@ -77,9 +77,16 @@ function extractLatestSection(changelogPath, version) {
   if (startIdx === -1) {
     throw new Error(`No "${header}" section found in ${changelogPath}`);
   }
+  // Stop only at a *version-shaped* `## ` heading — matches the
+  // changesets format `## 1.2.3` and the legacy semantic-release
+  // format `## [1.2.3](…)`. Without this constraint a changeset body
+  // that legitimately contains a `## Subsection` heading would
+  // prematurely terminate extraction and silently truncate the
+  // release notes.
+  const VERSION_HEADING = /^## \[?\d/;
   let endIdx = lines.length;
   for (let i = startIdx + 1; i < lines.length; i++) {
-    if (lines[i].startsWith('## ')) {
+    if (VERSION_HEADING.test(lines[i])) {
       endIdx = i;
       break;
     }
