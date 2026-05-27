@@ -86,7 +86,15 @@ function extractLatestSection(changelogPath, version) {
   }
   // Skip the heading itself — we replace it with the codename header
   // when writing the release notes; the CHANGELOG keeps the heading.
-  return lines.slice(startIdx + 1, endIdx).join('\n').trim();
+  // Trim trailing HTML comment blocks: changesets inserts the new
+  // section directly under `# Changelog`, so any prose / comments
+  // that live between the h1 preamble and the historical entries get
+  // pushed below the new section and would otherwise leak into the
+  // release notes. Drop a trailing `<!-- … -->` block (multi-line OK)
+  // before trimming whitespace.
+  let body = lines.slice(startIdx + 1, endIdx).join('\n').trim();
+  body = body.replace(/\n*<!--[\s\S]*?-->\s*$/m, '');
+  return body.trim();
 }
 
 function buildHeader(version) {
