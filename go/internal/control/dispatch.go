@@ -358,10 +358,10 @@ type State struct {
 	// resulting counters surface on /api/status so operators can spot
 	// systemic forecast vs reality drift. Site-signed: negative = the
 	// fleet discharged Wh during the slot.
-	slotActualWh         float64
-	slotActualLastTs     time.Time
-	slotActualSlotStart  time.Time
-	slotActualPlannedWh  float64 // planned BatteryEnergyWh cached for the slot in flight
+	slotActualWh        float64
+	slotActualLastTs    time.Time
+	slotActualSlotStart time.Time
+	slotActualPlannedWh float64 // planned BatteryEnergyWh cached for the slot in flight
 
 	// SlotDeliveryStats counts how many slots ended with the actual
 	// fleet delivery falling outside ±50 % of the planned magnitude.
@@ -1020,17 +1020,17 @@ func ComputeDispatch(
 	plannerSelfIdleGate := false
 	plannerSelfExportSurplusGate := false
 	plannerSelfNoChargeStalePlan := false
-	// passiveArbitrageIdleSlot tracks "we're in planner_passive_arbitrage on an
+	// arbitrageFamilyIdleSlot tracks "we're in planner_passive_arbitrage on an
 	// idle plan-slot (BatteryEnergyWh ≈ 0)". For these slots the DP picked
 	// idle deliberately; the live-export gate below uses this to suppress
 	// reactive absorption when actual conditions show PV surplus the
 	// forecast missed (mirror of plannerSelfExportSurplusGate, but
 	// triggered by LIVE grid sign rather than planned grid — since
 	// passive_arbitrage idle slots can be set with planned grid near zero).
-	passiveArbitrageIdleSlot := false
+	arbitrageFamilyIdleSlot := false
 	// coverLoadDischargeSlot: planner_arbitrage discharge slot the DP
 	// picked for covering load rather than peak export (PlannedGridW ≈ 0).
-	// Same outer-scope lift as passiveArbitrageIdleSlot so the post-block
+	// Same outer-scope lift as arbitrageFamilyIdleSlot so the post-block
 	// fall-through can recognise carve-out slots and force grid_target=0
 	// instead of letting PlanTarget set the planned import.
 	coverLoadDischargeSlot := false
@@ -1070,14 +1070,14 @@ func ComputeDispatch(
 		if state.UseEnergyDispatch && state.SlotDirective != nil {
 			if dir, ok := state.SlotDirective(time.Now()); ok {
 				currentDirective = dir
-				// planner_passive_arbitrage idle slots: skip the energy path and
+				// planner_arbitrage and planner_passive_arbitrage idle slots: skip the energy path and
 				// fall through to reactive PI (same as planner_self does always).
 				// When the plan slot is idle (BatteryEnergyWh ≈ 0), the energy
 				// formula produces targetTotalW=0 and cannot react to live
 				// conditions — a PV forecast miss leaves the site importing while
 				// the battery sits at 0 W. The reactive PI path handles this
 				// correctly, and planHasNonDischargeIntent (below) permits
-				// discharge for non-charge passive_arbitrage slots.
+				// discharge for non-charge arbitrage-family slots.
 				// Charge slots (BatteryEnergyWh > idleWh) still use the energy
 				// path so the DP's deliberate grid-charge intent is honoured.
 				const idleWhGate = 50.0
@@ -1086,10 +1086,11 @@ func ComputeDispatch(
 				// signed comparison alone (negative numbers satisfy
 				// the inequality), and would incorrectly route the
 				// live-export charge block onto a deliberate discharge
-				// decision. passive_arbitrage doesn't plan discharge
-				// today; the predicate is defensive. Codex P2 / #375
+				// decision. arbitrage-family discharge slots are
+				// caught by coverLoadDischargeSlot below. Codex P2 / #375
 				// follow-up.
-				passiveArbitrageIdleSlot = state.Mode == ModePlannerPassiveArbitrage &&
+				arbitrageFamilyIdleSlot = (state.Mode == ModePlannerPassiveArbitrage ||
+					state.Mode == ModePlannerArbitrage) &&
 					math.Abs(dir.BatteryEnergyWh) <= idleWhGate
 				// planner_arbitrage cover-load discharge slots: same fallthrough.
 				// The energy path's "extra export is bonus revenue" carve-out
@@ -1120,7 +1121,7 @@ func ComputeDispatch(
 					dir.HasPlannedGridW &&
 					dir.BatteryEnergyWh < -idleWhGate &&
 					dir.PlannedGridW > -coverLoadExportToleranceW
-				if !passiveArbitrageIdleSlot && !coverLoadDischargeSlot {
+				if !arbitrageFamilyIdleSlot && !coverLoadDischargeSlot {
 					useEnergyPath = true
 				}
 				// Distribution mode is decoupled from planner strategy in
@@ -1138,7 +1139,7 @@ func ComputeDispatch(
 				// would SetGridTarget(+plannedImport) — defeating the
 				// reactive carve-out entirely. Force the setpoint here
 				// and skip the legacy lookup. Codex P1, PR #378 follow-up.
-				if passiveArbitrageIdleSlot || coverLoadDischargeSlot {
+				if arbitrageFamilyIdleSlot || coverLoadDischargeSlot {
 					state.SetGridTarget(0)
 					// Mirror preparePlannerSelf (dispatch.go:797-804):
 					// if the slot was previously on the energy path —
@@ -1153,7 +1154,7 @@ func ComputeDispatch(
 				}
 			}
 		}
-		if !useEnergyPath && !passiveArbitrageIdleSlot && !coverLoadDischargeSlot {
+		if !useEnergyPath && !arbitrageFamilyIdleSlot && !coverLoadDischargeSlot {
 			var modeStr string
 			var gridW float64
 			ok := false
@@ -1328,19 +1329,19 @@ func ComputeDispatch(
 	// not turn into "absorb the live PV surplus" via reactive PI on grid=0.
 	// Battery stays at 0 in both directions for the slot — neither
 	// reactive charge from PV nor force-export discharge.
-	passiveArbitrageIdleLiveExportGate := false
-	if passiveArbitrageIdleSlot || coverLoadDischargeSlot {
+	arbitrageFamilyIdleLiveExportGate := false
+	if arbitrageFamilyIdleSlot || coverLoadDischargeSlot {
 		baselineGridW := gridW - currentTotal
 		if baselineGridW < -mpc.IdleGateThresholdW {
-			passiveArbitrageIdleLiveExportGate = true
+			arbitrageFamilyIdleLiveExportGate = true
 		}
 	}
 	// CHARGE-direction safeties for planner_self. exportSurplusGate +
 	// stale-plan block charge fully; idleGate applies a soft ceiling
 	// computed from live PV surplus (handled below, not via this flag).
-	// passiveArbitrageIdleLiveExportGate is the live-grid mirror that
+	// arbitrageFamilyIdleLiveExportGate is the live-grid mirror that
 	// extends the same charge-block to planner_passive_arbitrage idle slots.
-	noSelfCharge := !manualHoldActive && (plannerSelfExportSurplusGate || plannerSelfNoChargeStalePlan || passiveArbitrageIdleLiveExportGate)
+	noSelfCharge := !manualHoldActive && (plannerSelfExportSurplusGate || plannerSelfNoChargeStalePlan || arbitrageFamilyIdleLiveExportGate)
 
 	// ---- Compute totalCorrection — paths diverge here ----
 	var totalCorrection float64
@@ -1590,7 +1591,19 @@ func ComputeDispatch(
 			gridErr := projectedGridW - currentDirective.PlannedGridW
 			if gridErr > planGridDeadband {
 				adjusted := targetTotalW - gridErr
-				if adjusted < 0 {
+				// The back-off normally floors at 0 (charge → idle): on a
+				// deliberate grid-charge slot the plan meant to import, so a
+				// load surge must not flip it to discharge and undo the refill.
+				// But on a planner_arbitrage charge-from-PV-surplus slot
+				// (PlannedGridW below the grid-charge band — the DP only meant
+				// to soak surplus, not buy from the grid), let the target go
+				// negative so the battery covers the live load surge, driving
+				// projected grid back toward PlannedGridW (~0). This is the
+				// charge-side mirror of the discharge-slot cover-load carve-out;
+				// downstream SoC floor / fuse guard / slew still bound the
+				// discharge, and planHasNonDischargeIntent permits it for exactly
+				// these slots. Operator report 2026-05-30.
+				if adjusted < 0 && !coverLoadChargeSlot(state, currentDirective) {
 					adjusted = 0
 				}
 				targetTotalW = adjusted
@@ -2763,6 +2776,30 @@ func floorNegativeTargets(targets []DispatchTarget) []DispatchTarget {
 	return targets
 }
 
+// coverLoadChargeSlot reports whether the current plan slot is a
+// planner_arbitrage charge-from-PV-surplus slot: the DP meant to soak surplus
+// (PlannedGridW below the grid-charge import band), NOT buy from the grid.
+// Such a slot carries no hard charge commitment — when the forecast load is
+// wrong and the site is importing, the battery should reactively discharge to
+// cover it (the charge-side mirror of the discharge-slot cover-load carve-out).
+//
+// Three rails consult this so a legitimate cover-load discharge isn't undone:
+//   - the soft cap (ComputeDispatch) lets the back-off go negative,
+//   - planHasNonDischargeIntent doesn't block the reactive discharge,
+//   - applyPlanSignFloor (via planSignIntent) doesn't treat it as a
+//     plan/exec sign mismatch.
+//
+// A deliberate grid-charge slot (PlannedGridW ≥ band) is excluded: its
+// realisable refill intent is preserved. Operator report 2026-05-30.
+func coverLoadChargeSlot(state *State, dir SlotDirective) bool {
+	const idleWhGate = 50.0         // a near-zero per-slot energy is idle, not charge
+	const gridChargeImportW = 100.0 // PlannedGridW ≥ this ⇒ deliberate grid-charge
+	return state != nil && state.Mode == ModePlannerArbitrage &&
+		dir.HasPlannedGridW &&
+		dir.BatteryEnergyWh > idleWhGate &&
+		dir.PlannedGridW < gridChargeImportW
+}
+
 func planHasNonDischargeIntent(state *State) bool {
 	if state == nil || !state.Mode.IsPlannerMode() {
 		return false
@@ -2811,6 +2848,19 @@ func planHasNonDischargeIntent(state *State) bool {
 			if state.Mode == ModePlannerPassiveArbitrage {
 				return dir.BatteryEnergyWh > idleWh
 			}
+			if state.Mode == ModePlannerArbitrage {
+				// A charge-from-PV-surplus slot (coverLoadChargeSlot) and an
+				// idle slot both carry no protected charge decision, so reactive
+				// discharge may cover a forecast-missed load. Only a deliberate
+				// grid-charge slot (BatteryEnergyWh > idleWh and not a PV-surplus
+				// charge) keeps the non-discharge block.
+				if coverLoadChargeSlot(state, dir) {
+					return false
+				}
+				return dir.BatteryEnergyWh > idleWh
+			}
+			// planner_cheap (and any other planner mode): idle slots keep the
+			// non-discharge block; only deliberate discharge slots are exempt.
 			return dir.BatteryEnergyWh >= -idleWh
 		}
 	}
@@ -3357,6 +3407,12 @@ func planSignIntent(state *State) int {
 	if state.SlotDirective != nil {
 		if dir, ok := state.SlotDirective(time.Now()); ok {
 			if dir.BatteryEnergyWh > idleWh {
+				// A charge-from-PV-surplus slot has no hard charge commitment
+				// (see coverLoadChargeSlot) — report idle intent so the sign
+				// floor doesn't clamp a legitimate cover-load discharge.
+				if coverLoadChargeSlot(state, dir) {
+					return 0
+				}
 				return +1
 			}
 			if dir.BatteryEnergyWh < -idleWh {
