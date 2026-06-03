@@ -177,6 +177,12 @@ type Deps struct {
 	// Empty disables tunnel detection (pure-LAN deployments with no relay).
 	TunnelMarker string
 
+	// SiteIdentityPubHex is the uncompressed P-256 public key (X||Y, 128 hex
+	// chars) of this Pi's self-sovereign ES256 identity — generated on first
+	// boot regardless of Nova (see cmd/forty-two-watts/main.go). Empty if
+	// identity load failed; the /api/identity endpoint then returns 503.
+	SiteIdentityPubHex string
+
 	// ownerAccess is the lazy-initialised ceremony + session map. Built
 	// on first request via Server.ownerAccess().
 	ownerAccess *ownerAccessState
@@ -341,6 +347,9 @@ func (s *Server) routes() {
 	s.handle("GET  /api/owner-access/devices", s.handleOwnerDevicesList)
 	s.handle("DELETE /api/owner-access/devices/{credential_id_b64}", s.handleOwnerDeviceDelete)
 	s.handle("GET  /api/owner-access/whoami", s.handleOwnerWhoami)
+
+	// ---- Self-sovereign site identity (Phase 2) ----
+	s.handle("GET  /api/identity", s.handleIdentity)
 
 	// ---- Static web UI ----
 	// Everything not matched above falls through to the static server.
