@@ -13,6 +13,43 @@
 // to mount alongside other persistent header bits.
 import { FtwElement } from "./ftw-element.js";
 
+// Shared, deduped notification-history fetch. The badge poll, the modal
+// open, and any transient re-connect of the element can all ask for the
+// SAME (endpoint, limit) payload in a short window; without coalescing
+// that fans out into repeated identical GET /api/notifications/history
+// requests. Share a single in-flight request and reuse a fresh result for
+// a short TTL. Pass force=true (the manual Refresh button) to bypass it.
+// Mirrors next-app.js's fetchHistory / ftw-history-card's dailyFetchCache.
+const NOTIF_CACHE_TTL_MS = 5000;
+const notifFetchCache = new Map(); // "endpoint?limit" -> { at, rows?, promise? }
+
+function fetchNotifRows(url, force) {
+  const now = Date.now();
+  const c = notifFetchCache.get(url);
+  if (!force && c && (now - c.at) < NOTIF_CACHE_TTL_MS) {
+    if (c.rows) return Promise.resolve(c.rows);
+    if (c.promise) return c.promise;
+  }
+  const promise = fetch(url)
+    .then((r) => {
+      // Don't cache a non-OK response — drop the entry so the next call
+      // retries instead of serving a stale empty list for the TTL.
+      if (!r.ok) { notifFetchCache.delete(url); return []; }
+      return r.json().then((d) => {
+        const rows = Array.isArray(d) ? d : [];
+        notifFetchCache.set(url, { at: Date.now(), rows: rows });
+        return rows;
+      });
+    })
+    .catch(() => {
+      const cur = notifFetchCache.get(url);
+      if (cur && cur.promise === promise) notifFetchCache.delete(url);
+      return [];
+    });
+  notifFetchCache.set(url, { at: now, promise: promise });
+  return promise;
+}
+
 export class FtwNotifHistory extends FtwElement {
   static styles = `
     :host { display: inline-flex; align-items: center; }
@@ -87,13 +124,11 @@ export class FtwNotifHistory extends FtwElement {
   _limit()    { return parseInt(this.getAttribute("limit") || "100", 10); }
   _failHours(){ return parseInt(this.getAttribute("fail-hours") || "24", 10); }
 
-  async _fetchRows(limit) {
-    try {
-      var r = await fetch(this._endpoint() + "?limit=" + encodeURIComponent(limit || this._limit()));
-      if (!r.ok) return [];
-      var d = await r.json();
-      return Array.isArray(d) ? d : [];
-    } catch (e) { return []; }
+  _fetchRows(limit, force) {
+    var url = this._endpoint() + "?limit=" + encodeURIComponent(limit || this._limit());
+    // Coalesced + short-TTL cached (see fetchNotifRows). Never rejects —
+    // resolves to [] on any error, matching the prior behaviour.
+    return fetchNotifRows(url, force);
   }
 
   async _refreshBadge() {
@@ -140,7 +175,7 @@ export class FtwNotifHistory extends FtwElement {
     if (refresh) refresh.addEventListener("click", async () => {
       this._loading = true;
       this.update();
-      this._rows = await this._fetchRows();
+      this._rows = await this._fetchRows(this._limit(), true); // force: explicit refresh bypasses cache
       this._loading = false;
       this._refreshBadge();
       this.update();
