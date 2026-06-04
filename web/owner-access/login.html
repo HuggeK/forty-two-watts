@@ -35,10 +35,21 @@
     const base = apiBase();
     const msg = document.getElementById("msg");
 
+    let pendingAbort = null;
+
     async function runLogin(mediation) {
       msg.innerHTML = "";
+      // Only ONE WebAuthn ceremony may be in flight at a time. Abort any prior
+      // one — notably the conditional-UI autofill request started on load —
+      // before starting another, or the browser throws
+      // "OperationError: A request is already pending." The login/start fetch
+      // below gives the abort an async beat to land before the next get().
+      if (pendingAbort) pendingAbort.abort();
+      const abort = new AbortController();
+      pendingAbort = abort;
       try {
         const start = await fetch(base + "/api/owner-access/login/start", { method: "POST" });
+        if (abort.signal.aborted) return; // superseded while we were fetching
         if (start.status === 404) {
           msg.innerHTML = '<div class="err">No passkeys enrolled. Enroll one on the LAN dashboard first.</div>';
           return;
@@ -49,10 +60,10 @@
         }
         const { ceremony_token, options } = await start.json();
         const credOpts = decodeAssertionOptions(options);
-        const getOpts = { publicKey: credOpts };
+        const getOpts = { publicKey: credOpts, signal: abort.signal };
         if (mediation) getOpts.mediation = mediation;
         const cred = await navigator.credentials.get(getOpts);
-        if (!cred) return; // conditional aborted / no selection
+        if (!cred) return; // no selection
         const finish = await fetch(
           base + "/api/owner-access/login/finish?ceremony_token=" + encodeURIComponent(ceremony_token),
           {
@@ -69,15 +80,17 @@
         msg.innerHTML = '<div class="ok">Signed in. Redirecting…</div>';
         setTimeout(() => location.href = base + "/", 800);
       } catch (e) {
-        if (e.name === "AbortError") return; // conditional UI cancelled — silent
+        if (e.name === "AbortError") return; // cancelled / superseded — silent
         msg.innerHTML = `<div class="err">${e.name}: ${e.message}</div>`;
+      } finally {
+        if (pendingAbort === abort) pendingAbort = null;
       }
     }
 
     document.getElementById("signin").onclick = () => runLogin(undefined);
 
     // Conditional UI: silently offer the passkey on the autofill field when
-    // supported. The button remains the fallback for browsers without it.
+    // supported. Clicking the button aborts this and runs a modal ceremony.
     (async () => {
       try {
         if (await PublicKeyCredential.isConditionalMediationAvailable?.()) {
