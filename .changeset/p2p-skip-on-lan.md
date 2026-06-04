@@ -19,3 +19,10 @@ unchanged.
 The transport indicator is also corrected on the direct path: P2P is not
 applicable there, so the badge stays hidden (`off`) instead of showing a
 misleading, un-toggleable "Relay" state.
+
+Also dedupes the live 24h history request (`/api/history?range=24h&points=288`).
+It was triggered by boot, the 1-min poll, and every (undebounced) window
+resize, so a first-load layout resize storm fanned out into many identical
+requests. A small in-flight-coalescing + short-TTL cache (mirroring
+`ftw-history-card`'s `dailyFetchCache`) now shares one payload across those
+triggers; the periodic poll forces a fresh sample.
