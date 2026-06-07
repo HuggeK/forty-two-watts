@@ -41,6 +41,31 @@ const (
 	ModePlannerArbitrage        Mode = "planner_arbitrage"
 )
 
+// AllModes is the canonical, ordered list of every operator-selectable
+// Mode. It is the single source of truth: the API mode validator and the
+// Home Assistant discovery `select` options both derive from it, so a new
+// mode can't be added to the enum without automatically appearing in both
+// places. Order is operator-facing (simple → advanced → planner), so it's
+// also a safe order to render in a UI dropdown.
+func AllModes() []Mode {
+	return []Mode{
+		ModeIdle, ModeSelfConsumption, ModePeakShaving,
+		ModeCharge, ModePriority, ModeWeighted,
+		ModePlannerSelf, ModePlannerCheap,
+		ModePlannerPassiveArbitrage, ModePlannerArbitrage,
+	}
+}
+
+// IsValidMode reports whether s names a known Mode.
+func IsValidMode(m Mode) bool {
+	for _, valid := range AllModes() {
+		if m == valid {
+			return true
+		}
+	}
+	return false
+}
+
 // IsPlannerMode reports whether the mode is one of the planner modes.
 func (m Mode) IsPlannerMode() bool {
 	return m == ModePlannerSelf ||
