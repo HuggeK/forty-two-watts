@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -43,6 +44,8 @@ type relaySigner interface {
 // stays closed, which is the correct fail-closed default before wiring.
 var trustedDevicePubkeysLoader func() []string
 
+const ownerSiteIDKey = "owner_site_id"
+
 // loadTrustedDevicePubkeys returns the device-key set to publish, or nil when no
 // loader is wired or it errors. Always returns a non-nil-safe slice the caller
 // only marshals when len>0, so the field is omitted rather than sent as [].
@@ -51,6 +54,50 @@ func loadTrustedDevicePubkeys() []string {
 		return nil
 	}
 	return trustedDevicePubkeysLoader()
+}
+
+// deriveOwnerSiteID returns the stable, relay-routed site_id for owner remote
+// access. It is opaque and high-entropy so two default "Home" Pis cannot collide
+// on the public relay and the relay never routes by a human-readable label.
+func deriveOwnerSiteID(st *state.Store) string {
+	if st != nil {
+		if existing, ok := st.LoadConfig(ownerSiteIDKey); ok && existing != "" {
+			if isOpaqueOwnerSiteID(existing) {
+				return existing
+			}
+		}
+	}
+
+	b := make([]byte, 24)
+	_, _ = randomRead(b)
+	siteID := "site:" + base64.RawURLEncoding.EncodeToString(b)
+	if st != nil {
+		_ = st.SaveConfig(ownerSiteIDKey, siteID)
+	}
+	return siteID
+}
+
+func isOpaqueOwnerSiteID(siteID string) bool {
+	const prefix = "site:"
+	if !strings.HasPrefix(siteID, prefix) {
+		return false
+	}
+	token := strings.TrimPrefix(siteID, prefix)
+	if len(token) < 32 {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		c := token[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // deriveOwnerHostID returns a stable host_id for the owner-access
@@ -139,7 +186,18 @@ func runOwnerRelayRegistration(ctx context.Context, relayURL, siteID, hostID, tu
 	// served; the owner API + cookie are refused here too, as defence in depth
 	// behind the relay's identical refusal. No owner request or session ever
 	// rides this transport.
-	staticHost := buildStaticAssetHost(relayURL, hostID, apiPort)
+	// MULTI-TENANT enroll-forward: the relay's bootstrapEnrollForward enqueues
+	// POST /api/owner-access/enroll/{start,finish} onto THIS host's tunnel queue
+	// during the first-enrollment window (the new owner has no device key yet, so
+	// they can't open the P2P channel to enroll one — this is the one HTTP bridge
+	// across that gap). The host below additionally accepts those two POSTs and
+	// stamps X-FTW-Tunnel so the Pi's isTunneled gate fires (PIN + possession-proof
+	// + zero-device recheck + owner-cookie suppression). Default OFF: single-tenant
+	// deploys never wire the enroll routes and the host stays byte-identical to the
+	// static-only behaviour. (-multi-tenant lives on the relay; remote access
+	// opt-in lives in the Pi config.)
+	multiTenant := envBoolDefault("FTW_MULTI_TENANT", false)
+	staticHost := buildStaticAssetHost(relayURL, hostID, apiPort, multiTenant, tunnelMarker)
 	go staticHost.Run(ctx)
 
 	// The blind WebRTC signaling loop is the ONLY owner-DATA transport: it
@@ -260,27 +318,66 @@ func (p *pollSecretHolder) PollSecret() string {
 // identical refusal. So no owner request or session ever rides this transport;
 // owner data exists solely as DTLS DataChannel frames.
 //
-// Unlike the removed owner tunnel, this does NOT stamp the X-FTW-Tunnel marker:
-// it only ever proxies public assets, which the local gate already serves
-// without auth, and never an owner API call.
-func buildStaticAssetHost(relayURL, hostID string, apiPort int) *tunnel.Host {
+// Unlike the removed owner tunnel, the STATIC paths do NOT stamp the X-FTW-Tunnel
+// marker: they only ever proxy public assets, which the local gate already serves
+// without auth, and never an owner API call. The two MULTI-TENANT enroll routes
+// (when enabled) are the sole exception — they DO stamp the marker, see
+// staticAssetHandler.
+func buildStaticAssetHost(relayURL, hostID string, apiPort int, multiTenant bool, tunnelMarker string) *tunnel.Host {
+	return tunnel.NewHost(relayURL, hostID, buildStaticAssetHandler(apiPort, multiTenant, tunnelMarker))
+}
+
+// buildStaticAssetHandler constructs the fail-closed tunnel handler. It is split
+// out from buildStaticAssetHost so it can be exercised directly against a fake
+// local API in tests (the reverse proxy targets 127.0.0.1:<apiPort>).
+func buildStaticAssetHandler(apiPort int, multiTenant bool, tunnelMarker string) http.Handler {
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", apiPort))
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		http.Error(w, fmt.Sprintf("local api unavailable: %v", err), http.StatusBadGateway)
 	}
-	return tunnel.NewHost(relayURL, hostID, &staticAssetHandler{proxy: proxy})
+	return &staticAssetHandler{proxy: proxy, multiTenant: multiTenant, tunnelMarker: tunnelMarker}
+}
+
+// enrollForwardPaths are the ONLY owner-API paths this host forwards to the Pi,
+// and only under multi-tenant. They mirror the relay's bootstrapEnrollForward
+// allowlist — the first-enrollment bridge for an owner who has no device key yet.
+var enrollForwardPaths = map[string]struct{}{
+	"/api/owner-access/enroll/start":  {},
+	"/api/owner-access/enroll/finish": {},
 }
 
 // staticAssetHandler is the fail-closed wrapper around the reverse proxy: it
 // serves only public static assets (and the /api/identity TOFU anchor), refusing
 // every other /api/ path and every non-GET method so the owner API can never be
 // reached over the relay tunnel even if the relay's own refusal were bypassed.
+//
+// Under multiTenant it grows ONE narrow exception: POST of the two enroll routes
+// is forwarded to the local API with X-FTW-Tunnel stamped (so the Pi's isTunneled
+// gate fires — PIN + possession-proof + zero-device recheck + owner-cookie
+// suppression). No other path or method is broadened.
 type staticAssetHandler struct {
-	proxy *httputil.ReverseProxy
+	proxy        *httputil.ReverseProxy
+	multiTenant  bool
+	tunnelMarker string
 }
 
 func (h *staticAssetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// MULTI-TENANT enroll-forward: the relay enqueues POST enroll/{start,finish}
+	// onto this host's queue during the first-enrollment window. Stamp the trusted
+	// per-process marker (overwriting whatever rode in — a relay/browser can't
+	// forge it) so s.isTunneled(r) is true Pi-side, then forward to the local API.
+	// Set-Cookie is stripped on the way back exactly like the static path. ONLY
+	// these two exact paths + POST; everything else falls through to the
+	// fail-closed gate below (so a non-enroll /api POST is still 403/405).
+	if h.multiTenant && r.Method == http.MethodPost {
+		if _, ok := enrollForwardPaths[r.URL.Path]; ok {
+			r.Header.Set("X-FTW-Tunnel", h.tunnelMarker)
+			rec := &stripSetCookieWriter{ResponseWriter: w}
+			h.proxy.ServeHTTP(rec, r)
+			return
+		}
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "owner API is P2P-only", http.StatusMethodNotAllowed)
 		return
@@ -291,7 +388,9 @@ func (h *staticAssetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Strip any owner cookie before proxying to the local API: a static asset
 	// must never carry the owner session, and the local API must never set one on
-	// this path. Belt-and-braces behind the relay's own cookie stripping.
+	// this path. Belt-and-braces behind the relay's own cookie stripping. (The
+	// enroll-forward path above does NOT strip the request Cookie — the PIN/proof
+	// ride the query string, and the Pi suppresses the response cookie itself.)
 	r.Header.Del("Cookie")
 	rec := &stripSetCookieWriter{ResponseWriter: w}
 	h.proxy.ServeHTTP(rec, r)
