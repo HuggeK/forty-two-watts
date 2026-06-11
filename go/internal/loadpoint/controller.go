@@ -83,6 +83,11 @@ type Controller struct {
 	// compute-from-plan path.
 	holdMu sync.Mutex
 	holds  map[string]ManualHold
+	// manualHoldSaver, if non-nil, persists operator (Persistent) manual
+	// holds so they survive a reboot / firmware update and the EV keeps
+	// charging across the restart. Called on Set (persistent) and Clear.
+	// Timed/diagnostic holds are intentionally NOT persisted (ephemeral).
+	manualHoldSaver func(id string, h ManualHold, cleared bool)
 
 	// surplusMu protects surplusWin + surplusPaused, the per-loadpoint
 	// state that smooths the surplus_only pause/resume decision over
@@ -1022,15 +1027,28 @@ func (c *Controller) SetManualHold(id string, h ManualHold) {
 		return
 	}
 	c.holdMu.Lock()
-	defer c.holdMu.Unlock()
 	if c.holds == nil {
 		c.holds = map[string]ManualHold{}
 	}
+	cleared := false
 	if h.ExpiresAt.IsZero() && !h.Persistent {
 		delete(c.holds, id)
-		return
+		cleared = true
+	} else {
+		c.holds[id] = h
 	}
-	c.holds[id] = h
+	saver := c.manualHoldSaver
+	c.holdMu.Unlock()
+	// Persist outside the lock (saver may do disk I/O). Only persistent
+	// operator holds survive a restart; clearing or a timed hold writes the
+	// "cleared" sentinel so a stale persistent hold isn't resurrected.
+	if saver != nil {
+		if cleared || !h.Persistent {
+			saver(id, ManualHold{}, true)
+		} else {
+			saver(id, h, false)
+		}
+	}
 }
 
 // ClearManualHold removes any active hold for the given loadpoint,
@@ -1040,8 +1058,27 @@ func (c *Controller) ClearManualHold(id string) {
 		return
 	}
 	c.holdMu.Lock()
-	defer c.holdMu.Unlock()
+	_, existed := c.holds[id]
 	delete(c.holds, id)
+	saver := c.manualHoldSaver
+	c.holdMu.Unlock()
+	// Only persist the clear if a hold actually existed — ClearManualHold is
+	// called on every unplugged tick, and we must not hammer the store.
+	if saver != nil && existed {
+		saver(id, ManualHold{}, true)
+	}
+}
+
+// SetManualHoldSaver wires the persistence callback for operator manual
+// holds. Pass nil to disable. Wire it AFTER restoring persisted holds at
+// startup so the restore doesn't immediately re-write what it just read.
+func (c *Controller) SetManualHoldSaver(fn func(id string, h ManualHold, cleared bool)) {
+	if c == nil {
+		return
+	}
+	c.holdMu.Lock()
+	c.manualHoldSaver = fn
+	c.holdMu.Unlock()
 }
 
 // GetManualHold returns the current hold for a loadpoint. The bool
