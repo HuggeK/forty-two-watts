@@ -48,7 +48,7 @@ See [the direct-download fallback](#download-the-image-directly-fallback)
 | Port redirect | nftables maps 80 -> 8080 so `http://42w.local/` works without `:8080` |
 | Stack | `forty-two-watts`, `mosquitto`, `ftw-updater` (pulled from GHCR on first boot) |
 
-Image size: ~640 MB compressed, ~2.4 GB written to SD card (it then
+Image size: ~630 MB compressed, ~3.1 GB written to SD card (it then
 grows to fill the card on first boot). Any 8 GB or larger card works;
 16 GB+ recommended for headroom.
 
@@ -153,7 +153,7 @@ WiFi is configured at first boot via the **captive portal** flow
 Insert the SD card, plug in Ethernet (or rely on the captive
 portal), connect power. Three things happen automatically:
 
-1. **Partition resize.** The image is ~2.4 GB; Trixie grows the rootfs
+1. **Partition resize.** The image is ~3.1 GB; Trixie grows the rootfs
    to fill your SD card on first boot (initramfs + `rpi-resize.service`).
    Adds ~30 s.
 2. **cloud-init customisation.** If you set a hostname / SSH user / WiFi
