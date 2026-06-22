@@ -53,22 +53,27 @@ jobs:
           df -h /
 
       - name: Install qemu for arm64 cross-build
-        # pi-gen's arm64 (trixie) branch build-docker.sh requires the
-        # DYNAMIC `qemu-aarch64` binary on PATH (`which qemu-aarch64`)
-        # and then registers its OWN F-flagged binfmt handler
-        # (`qemu-aarch64-rpi`) plus `dpkg-reconfigure qemu-user-binfmt`
-        # inside the privileged container — see build-docker.sh on the
-        # arm64 branch. That's a different contract than the old
-        # bookworm-arm64 branch (which wanted qemu-aarch64-STATIC +
-        # tonistiigi/binfmt, and where qemu-user-binfmt's wrapper
-        # handlers broke arch-test in the chroot). For the arm64 branch
-        # we give it exactly what it asks for: qemu-user-binfmt, which
-        # provides /usr/bin/qemu-aarch64; pi-gen finishes the F-flag
-        # registration so it survives the chroot mount-namespace switch.
+        # pi-gen's arm64 (trixie) branch build-docker.sh has a preflight
+        # `which qemu-aarch64` and registers an F-flagged binfmt handler
+        # pointing at that binary. The interpreter MUST be STATICALLY
+        # linked: a dynamic qemu (qemu-user / qemu-user-binfmt) can't
+        # resolve its shared libs inside pi-gen's chroot, so arch-test
+        # fails with "arm64: not supported" (run 27952017470). So install
+        # qemu-user-static (--no-install-recommends keeps the wrapper-
+        # registering qemu-user-binfmt out) and expose the static binary
+        # under the unsuffixed name the preflight expects, plus
+        # tonistiigi/binfmt for F-flagged handlers that survive the chroot
+        # mount-namespace switch — the combo that built the bookworm image.
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user-binfmt
-          which qemu-aarch64   # the exact preflight build-docker.sh runs
+          sudo apt-get install -y -qq --no-install-recommends qemu-user-static
+          sudo ln -sf /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64
+          sudo docker run --privileged --rm tonistiigi/binfmt --install arm64
+          which qemu-aarch64
+          echo "--- binfmt_misc qemu-aarch64 handlers ---"
+          for f in /proc/sys/fs/binfmt_misc/qemu-aarch64*; do
+            echo "== ${f} =="; cat "${f}" 2>/dev/null || true
+          done
 
       - name: Checkout
         uses: actions/checkout@v5
