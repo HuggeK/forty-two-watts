@@ -44,6 +44,10 @@ package drivers
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -597,6 +601,36 @@ func registerHost(L *lua.LState, env *HostEnv) {
 		},
 	}
 
+	// TLS certificate pinning (opt-in, per driver). When the driver was
+	// granted capabilities.http.tls_pin_sha256, we DON'T trust the system
+	// roots — instead we accept exactly the one leaf certificate whose
+	// SHA-256 matches the pin. This is how a driver reaches an HTTPS
+	// endpoint with a self-signed cert (a NIBE heat pump's local REST API)
+	// without the SSRF-grade hole of blanket InsecureSkipVerify: a swapped
+	// cert (MITM) is rejected at the handshake even if it chains to a real
+	// CA. Drivers WITHOUT a pin keep Go's default transport untouched, so
+	// nothing about existing HTTP drivers changes.
+	if pin := normalizeHexFingerprint(env.HTTPTLSPinSHA256); pin != "" {
+		tr := net_http.DefaultTransport.(*net_http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{
+			// We replace chain/hostname verification with our own exact
+			// fingerprint check below, so the stdlib check must be off.
+			InsecureSkipVerify: true, //nolint:gosec // verified by pin in VerifyConnection
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				if len(cs.PeerCertificates) == 0 {
+					return fmt.Errorf("tls pin: server presented no certificate")
+				}
+				sum := sha256.Sum256(cs.PeerCertificates[0].Raw)
+				got := hex.EncodeToString(sum[:])
+				if subtle.ConstantTimeCompare([]byte(got), []byte(pin)) != 1 {
+					return fmt.Errorf("tls pin mismatch: leaf %s does not match pinned %s", got, pin)
+				}
+				return nil
+			},
+		}
+		httpClient.Transport = tr
+	}
+
 	applyHeaders := func(req *net_http.Request, L *lua.LState, argIdx int) {
 		tbl := L.OptTable(argIdx, nil)
 		if tbl == nil {
@@ -879,6 +913,35 @@ func splitHostPortLower(s string) (host, port string, hasPort bool) {
 		}
 	}
 	return s[:i], maybePort, true
+}
+
+// normalizeHexFingerprint canonicalises a SHA-256 certificate fingerprint
+// for comparison: strips the colons / spaces that `openssl -fingerprint`
+// emits and lower-cases the hex, so "73:D1:AC:..." and
+// "73d1ac..." compare equal. A value that doesn't reduce to exactly 64
+// hex chars returns "" (treated as "no usable pin").
+func normalizeHexFingerprint(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r >= 'a' && r <= 'f':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'F':
+			b.WriteRune(r + ('a' - 'A'))
+		case r == ':' || r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			// separators in openssl-style fingerprints — skip
+		default:
+			// any other character makes the pin unusable
+			return ""
+		}
+	}
+	out := b.String()
+	if len(out) != 64 {
+		return ""
+	}
+	return out
 }
 
 func modbusKindFromString(s string) (int32, bool) {

@@ -78,6 +78,16 @@ type HostEnv struct {
 	// backward compat with existing drivers that didn't declare a list.
 	// Populated from driver config `capabilities.http.allowed_hosts`.
 	HTTPAllowedHosts []string
+	// HTTPTLSPinSHA256, when non-empty, pins the HTTPS leaf certificate to
+	// this SHA-256 fingerprint (hex; colons/whitespace ignored, case-
+	// insensitive — same value as `openssl x509 -fingerprint -sha256`).
+	// When set, the http_* client for THIS driver replaces system-root
+	// chain verification with an exact leaf-fingerprint match, so a driver
+	// can talk to a self-signed HTTPS endpoint (e.g. a heat pump's local
+	// REST API) without trusting any other certificate. Empty = standard
+	// verification (unchanged default for all existing HTTP drivers).
+	// Populated from driver config `capabilities.http.tls_pin_sha256`.
+	HTTPTLSPinSHA256 string
 	WS               WSCap // nil → ws_* calls return ErrNoCapability
 	// WSAllowedHosts mirrors HTTPAllowedHosts but for ws://+wss:// URLs
 	// passed to host.ws_open. Same matching semantics; empty = any host.
@@ -146,6 +156,14 @@ func (h *HostEnv) WithHTTP() *HostEnv { h.HTTP = true; return h }
 // means "any host" (backward compatible). Matched against URL host.
 func (h *HostEnv) WithHTTPAllowedHosts(hosts []string) *HostEnv {
 	h.HTTPAllowedHosts = hosts
+	return h
+}
+
+// WithHTTPTLSPin pins the HTTPS leaf certificate this driver's http_*
+// calls will accept, by SHA-256 fingerprint. Empty string = no pin
+// (standard system-root verification). See HostEnv.HTTPTLSPinSHA256.
+func (h *HostEnv) WithHTTPTLSPin(fp string) *HostEnv {
+	h.HTTPTLSPinSHA256 = fp
 	return h
 }
 
