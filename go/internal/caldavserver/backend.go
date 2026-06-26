@@ -137,10 +137,24 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 	if err != nil {
 		return nil, err
 	}
-	// caldav.Filter applies the component/property/time-range filters.
-	// NB: recurrence Expand is not performed (prototype) — recurring events
-	// return as their master VEVENT.
-	return caldav.Filter(query, objs)
+	// caldav.Filter applies the component/property/time-range filters (it also
+	// evaluates the recurrence set so a recurring master matches when any of its
+	// instances falls in range).
+	matched, err := caldav.Filter(query, objs)
+	if err != nil {
+		return nil, err
+	}
+	// RFC 4791 CALDAV:expand — turn each recurring master into the concrete
+	// instances inside the requested window. Without this a "weekly away" event
+	// would return only its first occurrence. go-webdav v0.7 drops the explicit
+	// <expand> element, so the window comes from the comp-filter time-range that
+	// the client sends alongside it. See expand.go.
+	if exp := findExpand(query.CompRequest); exp != nil {
+		matched = expandObjects(matched, exp.Start, exp.End)
+	} else if start, end, ok := filterTimeRange(query.CompFilter); ok {
+		matched = expandObjects(matched, start, end)
+	}
+	return matched, nil
 }
 
 func (b *backend) PutCalendarObject(ctx context.Context, path string, cal *ical.Calendar, opts *caldav.PutCalendarObjectOptions) (*caldav.CalendarObject, error) {

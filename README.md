@@ -28,8 +28,8 @@ published build.
   *Charge car 80%* sets an EV departure deadline — and publishes charging
   windows + EVSE usage history back to a calendar you can subscribe to. 42W
   hosts CalDAV itself, in-process, via [`emersion/go-webdav`](https://github.com/emersion/go-webdav)
-  (no extra container; works as a Home Assistant add-on), or via a bundled
-  Radicale sidecar. See [`docs/caldav-integration.md`](docs/caldav-integration.md).
+  — no extra container, recurring events supported, and it works as a Home
+  Assistant add-on. See [`docs/caldav-integration.md`](docs/caldav-integration.md).
 - **Multi-device control**: multiple meters, inverters, batteries, PV-only
   devices, and chargers can run side by side.
 - **Local operation**: the control loop does not depend on a cloud service.

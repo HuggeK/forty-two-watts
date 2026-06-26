@@ -25,7 +25,6 @@ on:
       - '.github/workflows/rpi-image-build.yml'
       - 'docker-compose.yml'
       - 'mosquitto/config/**'
-      - 'radicale/config/**'
 
 # A new push to a PR cancels the previous in-flight build. 30 min is
 # too long to chain — we just want the latest.

@@ -45,7 +45,7 @@ func putEvent(t *testing.T, c *caldav.Client, path, uid, summary string, start, 
 // TestNativeServerRoundTrip drives the in-process CalDAV server with 42W's own
 // go-webdav client: PUT an event, read it back via a calendar-query REPORT,
 // then DELETE it. This is exactly the inbound/outbound path the calendar
-// service uses, so it proves the native server is a drop-in for Radicale.
+// service uses.
 func TestNativeServerRoundTrip(t *testing.T) {
 	srv := httptest.NewServer(testHandler("u", "p", "/u/", []string{"/u/energy/"}))
 	defer srv.Close()

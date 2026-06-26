@@ -32,8 +32,8 @@ type LoadpointTargeter interface {
 }
 
 // Service is a CalDAV *client*. It periodically polls a calendar collection
-// (served by 42W's own native in-process server by default, or the bundled
-// Radicale sidecar), classifies events by title keyword, and applies the
+// (served by 42W's own in-process native CalDAV server — see
+// internal/caldavserver), classifies events by title keyword, and applies the
 // resulting intents:
 //
 //   - "away" intervals → loadmodel away/home profile switch (live + training),
@@ -62,12 +62,9 @@ type Service struct {
 	// Start). Drives the forward-looking plan publisher.
 	planSource PlanSource
 
-	// Managed-credential provisioning. manageCreds = 42W owns the credential
-	// (shown in the UI). writeHtpasswd = also write the Radicale htpasswd file
-	// — only in radicale mode; the native server authenticates in-process.
-	manageCreds   bool
-	writeHtpasswd bool
-	htpasswdPath  string
+	// manageCreds = 42W owns the credential (generated on first enable and shown
+	// in the UI); the in-process native server authenticates against it.
+	manageCreds bool
 
 	// mu guards the resolved config + live diagnostic state below.
 	mu             sync.RWMutex
@@ -191,10 +188,6 @@ func (s *Service) applyConfig(cfg config.CalDAV, firstLoadpointID string) {
 	if username == "" && cfg.ManageCredentialsEnabled() {
 		username = config.DefaultCalDAVUsername
 	}
-	htpasswdPath := strings.TrimSpace(cfg.HtpasswdPath)
-	if htpasswdPath == "" {
-		htpasswdPath = config.DefaultCalDAVHtpasswdPath
-	}
 	histPath := strings.TrimSpace(cfg.HistoryPath)
 	if histPath == "" {
 		histPath = config.DefaultCalDAVHistoryPath
@@ -229,8 +222,6 @@ func (s *Service) applyConfig(cfg config.CalDAV, firstLoadpointID string) {
 	s.username = username
 	s.password = cfg.Password
 	s.manageCreds = cfg.ManageCredentialsEnabled()
-	s.writeHtpasswd = cfg.ManageCredentialsEnabled() && cfg.ServerMode() != "native"
-	s.htpasswdPath = htpasswdPath
 	s.pollInterval = time.Duration(poll) * time.Second
 	s.horizon = time.Duration(horizonDays) * 24 * time.Hour
 	s.prs = newParser(away, evk, defaultLP, targetSoC)
@@ -250,7 +241,6 @@ func (s *Service) Reload(cfg config.CalDAV, firstLoadpointID string) {
 		return
 	}
 	s.applyConfig(cfg, firstLoadpointID)
-	s.provisionHtpasswd()
 	slog.Info("caldav config reloaded")
 }
 
@@ -274,9 +264,6 @@ func (s *Service) Start(ctx context.Context) {
 	if !enabled {
 		return
 	}
-	// Write the managed Radicale credential before polling so the first fetch
-	// authenticates against it.
-	s.provisionHtpasswd()
 	s.stop = make(chan struct{})
 	s.running = true
 	s.wg.Add(1)

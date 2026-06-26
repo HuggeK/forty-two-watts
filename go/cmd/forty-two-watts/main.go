@@ -194,9 +194,9 @@ func main() {
 		}
 	}
 	// Managed credential (#498): mint a random password on first enable so the
-	// operator never runs `htpasswd` by hand. Persisted to state.db; the
-	// calendar service writes it into the Radicale htpasswd file on Start and
-	// the Settings tab shows it (with a QR) to paste into a calendar app.
+	// operator never sets one by hand. Persisted to state.db; the in-process
+	// CalDAV server authenticates against it and the Settings tab shows it (with
+	// a QR) to paste into a calendar app.
 	if cfg.CalDAV.ManageCredentialsEnabled() && cfg.CalDAV.Password == "" {
 		if tok, err := calendar.GenerateToken(18); err != nil {
 			slog.Warn("caldav: failed to generate managed credential", "err", err)
@@ -204,7 +204,7 @@ func main() {
 			slog.Warn("caldav: failed to persist managed credential", "err", err)
 		} else {
 			cfg.CalDAV.Password = tok
-			slog.Info("caldav: generated managed Radicale credential")
+			slog.Info("caldav: generated managed credential")
 		}
 	}
 
@@ -784,44 +784,34 @@ func main() {
 	slog.Info("loadmodel started", "peak_w", loadPeakW, "quality", loadSvc.Model().Quality())
 
 	// ---- Calendar (CalDAV) planner constraints (#498) ----
-	// 42W is a CalDAV *client* of the bundled Radicale sidecar: it maps "away"
-	// events onto the load model's away profile and EV "charged-by-departure"
-	// events onto loadpoint targets. Opt-in + fail-soft; enable/disable is
-	// restart-gated (config.RestartRequiredFor), so the runtime block only ever
-	// exists while enabled.
-	var caldavUnavailable string
+	// 42W hosts its own in-process, pure-Go CalDAV server (internal/caldavserver,
+	// emersion/go-webdav, MIT) and runs a CalDAV *client* against it: it maps
+	// "away" events onto the load model's away profile and EV
+	// "charged-by-departure" events onto loadpoint targets. Opt-in + fail-soft;
+	// enable/disable is restart-gated (config.RestartRequiredFor), so the runtime
+	// block only ever exists while enabled. Single-container friendly — runs in a
+	// Home Assistant add-on with no sidecar.
 	var caldavSrv *caldavserver.Server
 	if cfg.CalDAV != nil && cfg.CalDAV.Enabled {
-		native := cfg.CalDAV.ServerMode() == "native"
-		// Only the Radicale-SIDECAR mode is unavailable in a single-container HA
-		// add-on (GPLv3 must run at arm's length in its own container). The
-		// native in-process server (MIT, pure-Go) works there, so it's exempt.
-		if !native && runningAsHAAddon() && !envBool("FTW_CALDAV_FORCE") {
-			caldavUnavailable = "ha-addon"
-			slog.Warn("caldav: Radicale-sidecar mode disabled in this deploy mode — set `caldav.server: native` (in-process, MIT) to run the calendar here, or FTW_CALDAV_FORCE=1 for a separate Radicale add-on (issue #498)")
-		} else {
-			if native {
-				// Host CalDAV in-process (no Radicale sidecar). The calendar
-				// client below still talks to it over localhost, so the
-				// inbound/outbound intent logic is unchanged.
-				principal, calPaths := nativeCalDAVLayout(cfg.CalDAV)
-				// Persist calendar objects in state.db so they survive restarts.
-				caldavSrv = caldavserver.New(cfg.CalDAV.ListenAddr(), caldavUsername(cfg.CalDAV), cfg.CalDAV.Password, principal, calPaths, st)
-				caldavSrv.Start()
-				defer caldavSrv.Stop()
-			}
-			calSvc = calendar.New(*cfg.CalDAV, lpMgr, loadSvc, firstLoadpointID(cfg.Loadpoints))
-			// Outbound EVSE history: feed live EV charge-point readings so the
-			// service can author a calendar event per completed session.
-			calSvc.SetEVSource(func() []calendar.EVSample { return evSamplesFromTelemetry(tel) })
-			// Outbound plan publishing: feed the current MPC plan so the service
-			// can render forward-looking charge/discharge windows. mpcSvc is built
-			// just below; the closure reads it at call time (nil-safe until then).
-			calSvc.SetPlanSource(func() []calendar.PlanSlot { return planSlotsFromMPC(mpcSvc) })
-			calSvc.Start(ctx)
-			defer calSvc.Stop()
-			slog.Info("caldav calendar client started", "mode", cfg.CalDAV.ServerMode(), "url", cfg.CalDAV.URL, "calendar", cfg.CalDAV.CalendarPath)
-		}
+		// Host CalDAV in-process; the client below talks to it over localhost, so
+		// the inbound/outbound intent logic is the same regardless. Objects
+		// persist in state.db so they survive restarts.
+		principal, calPaths := nativeCalDAVLayout(cfg.CalDAV)
+		caldavSrv = caldavserver.New(cfg.CalDAV.ListenAddr(), caldavUsername(cfg.CalDAV), cfg.CalDAV.Password, principal, calPaths, st)
+		caldavSrv.Start()
+		defer caldavSrv.Stop()
+
+		calSvc = calendar.New(*cfg.CalDAV, lpMgr, loadSvc, firstLoadpointID(cfg.Loadpoints))
+		// Outbound EVSE history: feed live EV charge-point readings so the
+		// service can author a calendar event per completed session.
+		calSvc.SetEVSource(func() []calendar.EVSample { return evSamplesFromTelemetry(tel) })
+		// Outbound plan publishing: feed the current MPC plan so the service
+		// can render forward-looking charge/discharge windows. mpcSvc is built
+		// just below; the closure reads it at call time (nil-safe until then).
+		calSvc.SetPlanSource(func() []calendar.PlanSlot { return planSlotsFromMPC(mpcSvc) })
+		calSvc.Start(ctx)
+		defer calSvc.Stop()
+		slog.Info("caldav started", "listen", cfg.CalDAV.ListenAddr(), "url", cfg.CalDAV.URL, "calendar", cfg.CalDAV.CalendarPath)
 	}
 
 	// ---- Start MPC planner (optional) ----
@@ -1649,21 +1639,20 @@ func main() {
 		// from the state.db path rather than the config path because
 		// `state.db` is always in the main data volume; the config
 		// can legitimately live elsewhere (e.g. mounted RO from /etc).
-		SnapshotDir:       filepath.Join(filepath.Dir(statePath), "snapshots"),
-		Prices:            priceSvc,
-		Forecast:          forecastSvc,
-		MPC:               mpcSvc,
-		PVModel:           pvSvc,
-		LoadModel:         loadSvc,
-		Loadpoints:        lpMgr,
-		LoadpointCtrl:     lpController,
-		CalDAV:            calSvc,
-		CalDAVUnavailable: caldavUnavailable,
-		HA:                haBridge,
-		Registry:          reg,
-		Events:            bus,
-		Notifications:     notifSvc,
-		SelfUpdate:        selfUpdater,
+		SnapshotDir:   filepath.Join(filepath.Dir(statePath), "snapshots"),
+		Prices:        priceSvc,
+		Forecast:      forecastSvc,
+		MPC:           mpcSvc,
+		PVModel:       pvSvc,
+		LoadModel:     loadSvc,
+		Loadpoints:    lpMgr,
+		LoadpointCtrl: lpController,
+		CalDAV:        calSvc,
+		HA:            haBridge,
+		Registry:      reg,
+		Events:        bus,
+		Notifications: notifSvc,
+		SelfUpdate:    selfUpdater,
 		// ---- Owner remote access ----
 		// rp.id defaults to the production home host (home.fortytwowatts.com),
 		// the origin the owner actually visits. Override with
@@ -2698,8 +2687,8 @@ func caldavUsername(cv *config.CalDAV) string {
 	return config.DefaultCalDAVUsername
 }
 
-// nativeCalDAVLayout derives the principal path + the collections the native
-// CalDAV server (#498, native mode) should expose, from config (with defaults).
+// nativeCalDAVLayout derives the principal path + the collections the
+// in-process CalDAV server (#498) should expose, from config (with defaults).
 func nativeCalDAVLayout(cv *config.CalDAV) (principal string, calendarPaths []string) {
 	principal = "/" + caldavUsername(cv) + "/"
 	calPath := config.DefaultCalDAVCalendarPath
@@ -3215,36 +3204,6 @@ func troubleshootingSumOnlineW(tel *telemetry.Store, typ telemetry.DerType) floa
 		sum += r.SmoothedW
 	}
 	return sum
-}
-
-// runningAsHAAddon reports whether 42W is running as a Home Assistant add-on
-// (a single Supervisor-managed container). It gates the calendar feature off
-// there: the calendar relies on the bundled Radicale sidecar, which is GPLv3
-// and so must run at arm's length in its own container — a clean license
-// boundary that keeps 42W permissively licensable (MIT/Apache-2.0). The
-// single-container add-on model can't provide a separate sidecar.
-//
-// Detection prefers an explicit FTW_HA_ADDON=1 that the add-on sets; the
-// Supervisor token + add-on options file are best-effort fallbacks. 42W's own
-// data dir is /app/data (not /data), so the options.json probe won't
-// false-positive on a normal compose/binary deploy.
-//
-// TODO(#498): wire up the calendar feature on HA OS / HA Supervised — likely a
-// SEPARATE Radicale add-on that 42W dials over the Supervisor network
-// (FTW_CALDAV_FORCE=1 already allows that), or a native MIT-licensed in-process
-// CalDAV server (emersion/go-webdav) that sidesteps the sidecar entirely.
-// Coordinating with @erikarenhill (erikarenhill/ha-addon-forty-two-watts).
-func runningAsHAAddon() bool {
-	if envBool("FTW_HA_ADDON") {
-		return true
-	}
-	if os.Getenv("SUPERVISOR_TOKEN") != "" || os.Getenv("HASSIO_TOKEN") != "" {
-		return true
-	}
-	if _, err := os.Stat("/data/options.json"); err == nil {
-		return true
-	}
-	return false
 }
 
 // envBool returns true iff the env var is set to a positive value

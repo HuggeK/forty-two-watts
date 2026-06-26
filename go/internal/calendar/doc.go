@@ -1,8 +1,8 @@
 // Package calendar consumes calendar events as planner constraints (issue
-// #498). forty-two-watts does NOT host CalDAV — it runs a CalDAV *client* that
-// polls a calendar collection served by the bundled Radicale sidecar (or any
-// CalDAV/iCal server) and maps events into intents the planner already knows
-// how to honour:
+// #498). forty-two-watts runs a CalDAV *client* against its own in-process
+// native CalDAV server (internal/caldavserver) — it polls a calendar
+// collection and maps events into intents the planner already knows how to
+// honour:
 //
 //   - an "away"/vacation event switches the load model to its away profile for
 //     the interval (loadmodel.ProfileAway, ~25% load) so the MPC conserves

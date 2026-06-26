@@ -258,10 +258,10 @@ type EVChargerModbus struct {
 	UnitID int    `yaml:"unit_id,omitempty" json:"unit_id,omitempty"`
 }
 
-// CalDAV configures the inbound calendar-constraints client (issue #498).
-// 42W does NOT host CalDAV — it is a CalDAV *client* that polls a calendar
-// collection served by the bundled Radicale sidecar (or any CalDAV server)
-// and maps events into planner intents:
+// CalDAV configures the calendar-constraints feature (issue #498). 42W hosts
+// its own in-process, pure-Go CalDAV server (emersion/go-webdav, MIT — see
+// internal/caldavserver) and runs a CalDAV *client* against it that polls the
+// calendar collection and maps events into planner intents:
 //
 //   - an "away"/vacation event switches the load model to its away profile
 //     for the interval, so the planner conserves battery while the house is
@@ -279,8 +279,8 @@ type EVChargerModbus struct {
 type CalDAV struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 
-	// URL is the base URL of the CalDAV server. Defaults to the bundled
-	// Radicale sidecar at http://localhost:5232.
+	// URL is the base URL of the CalDAV server. Defaults to the in-process
+	// native server at http://localhost:5232.
 	URL string `yaml:"url,omitempty" json:"url,omitempty"`
 
 	Username string `yaml:"username,omitempty" json:"username,omitempty"`
@@ -329,34 +329,15 @@ type CalDAV struct {
 	PlanPublishIntervalS int    `yaml:"plan_publish_interval_s,omitempty" json:"plan_publish_interval_s,omitempty"`
 
 	// ManageCredentials (default ON when enabled) makes 42W generate a random
-	// password on first enable and write the Radicale htpasswd file itself, so
-	// the operator never runs `htpasswd` by hand. The credential is shown in
-	// the Settings → Calendar tab (with a QR) to paste into a calendar app.
-	// Requires HtpasswdPath to point at a file 42W can write that Radicale
-	// reads (the shared ./radicale/config mount in docker-compose).
-	ManageCredentials *bool  `yaml:"manage_credentials,omitempty" json:"manage_credentials,omitempty"`
-	HtpasswdPath      string `yaml:"htpasswd_path,omitempty" json:"htpasswd_path,omitempty"`
+	// password on first enable, which the in-process CalDAV server then
+	// authenticates against. The credential is shown in the Settings → Calendar
+	// tab (with a QR) to paste into a calendar app, so the operator never has to
+	// set one by hand.
+	ManageCredentials *bool `yaml:"manage_credentials,omitempty" json:"manage_credentials,omitempty"`
 
-	// Server selects the CalDAV server 42W talks to:
-	//   "native" (default) — an in-process pure-Go server (emersion/go-webdav,
-	//     MIT) that needs no sidecar, so it works in a single binary / container
-	//     incl. the HA add-on. Objects persist in state.db. (Still maturing: no
-	//     server-side recurrence expansion yet — recurring events show only
-	//     their first occurrence.)
-	//   "radicale" — the bundled Radicale sidecar (GPLv3, separate container;
-	//     not available in a single-container HA add-on). Use it if you need
-	//     recurring events or broad calendar-app interop today.
-	Server string `yaml:"server,omitempty" json:"server,omitempty"`
-	// Listen is the bind address for the native server (default ":5232").
+	// Listen is the bind address for the in-process CalDAV server. Default
+	// ":5232". 42W binds it on the LAN (never routed through the owner relay).
 	Listen string `yaml:"listen,omitempty" json:"listen,omitempty"`
-}
-
-// ServerMode returns "native" (the default) or "radicale". Nil-safe.
-func (cv *CalDAV) ServerMode() string {
-	if cv != nil && strings.EqualFold(strings.TrimSpace(cv.Server), "radicale") {
-		return "radicale"
-	}
-	return "native"
 }
 
 // ListenAddr returns the native CalDAV server bind address (default ":5232").
@@ -367,8 +348,8 @@ func (cv *CalDAV) ListenAddr() string {
 	return ":5232"
 }
 
-// ManageCredentialsEnabled reports whether 42W should auto-generate + write the
-// Radicale htpasswd credential. Nil-safe; defaults ON when the feature is on.
+// ManageCredentialsEnabled reports whether 42W should auto-generate the managed
+// CalDAV credential. Nil-safe; defaults ON when the feature is on.
 func (cv *CalDAV) ManageCredentialsEnabled() bool {
 	return cv != nil && cv.Enabled && (cv.ManageCredentials == nil || *cv.ManageCredentials)
 }
@@ -393,9 +374,6 @@ var (
 	DefaultCalDAVHistoryPath  = "/fortytwowatts/history/"
 	DefaultCalDAVPlanPath     = "/fortytwowatts/plan/"
 	DefaultCalDAVPlanPublishS = 900
-	// DefaultCalDAVHtpasswdPath is where 42W writes the managed Radicale
-	// credential inside its container — the shared ./radicale/config mount.
-	DefaultCalDAVHtpasswdPath = "/app/radicale-config/users"
 	DefaultCalDAVUsername     = "fortytwowatts"
 	DefaultCalDAVPollS        = 300
 	DefaultCalDAVHorizonDays  = 7

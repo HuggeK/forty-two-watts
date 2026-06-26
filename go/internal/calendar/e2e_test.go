@@ -15,8 +15,8 @@ import (
 // application against the REAL loadmodel.Service and loadpoint.Manager (no
 // fakes), so a regression in the wiring — wrong profile constant, mis-plumbed
 // loadpoint id — is caught. The CalDAV wire itself (REPORT/Expand/PUT/DELETE)
-// is covered by the caldav_it-tagged integration test against a real Radicale;
-// this is the CI-safe complement that proves the planner-side effects.
+// is covered by the caldav_it-tagged integration test against a real CalDAV
+// server; this is the CI-safe complement that proves the planner-side effects.
 func TestEndToEndRealCollaborators(t *testing.T) {
 	st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

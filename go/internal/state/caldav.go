@@ -5,8 +5,8 @@ import (
 	"fmt"
 )
 
-// CalDAVObject is one stored calendar object (.ics) for the native CalDAV
-// server (#498, caldav.server: native). Data is the raw iCalendar text.
+// CalDAVObject is one stored calendar object (.ics) for the native in-process
+// CalDAV server (#498). Data is the raw iCalendar text.
 type CalDAVObject struct {
 	Path       string
 	Collection string

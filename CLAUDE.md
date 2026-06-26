@@ -54,8 +54,8 @@ in YAML or re-adding it doesn't orphan a trained model. See
 | `go/internal/loadmodel` | Household load twin (bucketed + heating coefficient) |
 | `go/internal/pvmodel` | PV twin (RLS over sunpos / cloud prior) |
 | `go/internal/mpc` | MPC planner — DP over SoC grid, 48 h horizon |
-| `go/internal/calendar` | CalDAV-client planner constraints (#498) — title-keyword intents (away → load profile, EV deadline → loadpoint target) + EVSE usage history writer; talks to the bundled Radicale sidecar |
-| `go/internal/caldavserver` | Native in-process CalDAV server (#498) on emersion/go-webdav (MIT) — `caldav.server: native` alternative to the Radicale sidecar; works single-container (HA add-on). Objects persist in state.db (`caldav_objects`); gaps: recurrence expansion, broad client interop |
+| `go/internal/calendar` | CalDAV-client planner constraints (#498) — title-keyword intents (away → load profile, EV deadline → loadpoint target) + EVSE usage history + plan publishing; polls 42W's own in-process `caldavserver` |
+| `go/internal/caldavserver` | Native in-process CalDAV server (#498) on emersion/go-webdav (MIT) — the only CalDAV server (no sidecar), so the calendar feature works single-container incl. a HA add-on. Objects persist in state.db (`caldav_objects`); recurring events expanded server-side (`expand.go`) |
 | `go/internal/selfupdate` | GH Releases probe + trigger dispatch for the in-app updater sidecar |
 | `go/internal/nova` | Opt-in federation client to Sourceful Nova Core — ES256 identity, JWT signer, HTTP client (claim + provision), clean telemetry payload + boundary adapter, MQTT publisher |
 | `go/cmd/ftw-updater` | Sidecar binary — runs docker compose pull + up -d on behalf of the main service |
@@ -298,6 +298,6 @@ light theme can flip it cleanly.
 - `docs/mpc-planner.md` — MPC strategies, confidence blending
 - `docs/ml-twins.md` — older twin notes (superseded by ml-models.md)
 - `docs/ha-integration.md` — Home Assistant MQTT bridge
-- `docs/caldav-integration.md` — calendar planner constraints (#498): native in-process CalDAV server (emersion/go-webdav, default) or Radicale sidecar; away/EV intents, EVSE history + plan publishing
+- `docs/caldav-integration.md` — calendar planner constraints (#498): 42W's in-process native CalDAV server (emersion/go-webdav, MIT; no sidecar; recurrence expanded server-side); away/EV intents, EVSE history + plan publishing
 - `docs/lua-drivers.md` — earlier Lua driver notes (superseded by writing-a-driver.md)
 - `docs/archive/rust-go-wasm-migration-plan.md` — historical Rust→Go migration context

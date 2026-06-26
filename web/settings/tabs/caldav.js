@@ -1,5 +1,5 @@
 // Settings → Calendar tab: CalDAV planner-constraints client (#498).
-// 42W can manage the Radicale credential itself and show it here (with a QR)
+// 42W can manage the calendar credential itself and show it here (with a QR)
 // to add to a phone/desktop calendar app. All server-supplied values are
 // rendered via textContent / DOM nodes (never innerHTML) so a hostile or
 // MITM'd CalDAV server cannot inject markup into this gated settings page.
@@ -12,8 +12,8 @@
     return fetch(path, opts);
   }
 
-  // Calendar apps on the LAN can't reach "localhost" (that's the 42W↔Radicale
-  // link); rewrite it to the host serving this dashboard.
+  // Calendar apps on the LAN can't reach "localhost" (that's 42W's own link to
+  // its in-process CalDAV server); rewrite it to the host serving this dashboard.
   function lanURL(u) {
     if (!u) return u;
     try {
@@ -91,11 +91,11 @@
       var html =
         '<div id="caldav-status-indicator" class="ha-status-indicator">checking…</div>' +
         '<fieldset><legend>Calendar (CalDAV)</legend>' +
-        '<p class="hint">42W reads a calendar served by the bundled Radicale sidecar and turns events into planner constraints. It stays on your local network — nothing here is exposed to the internet.</p>' +
+        '<p class="hint">42W hosts its own built-in CalDAV server and turns the events you add into planner constraints. It stays on your local network — nothing here is exposed to the internet.</p>' +
         '<label><input type="checkbox" data-checkbox-path="caldav.enabled"' + (config.caldav.enabled ? " checked" : "") + "> Enabled</label>" +
         '<label><input type="checkbox" data-checkbox-path="caldav.manage_credentials"' + (managed ? " checked" : "") + "> Let 42W manage the calendar password (recommended)</label>" +
         '<div class="field-row"><div>' +
-        field("Server URL", "caldav.url", "text", "http://localhost:5232", "Base URL of the CalDAV server. Defaults to the bundled Radicale sidecar.") +
+        field("Server URL", "caldav.url", "text", "http://localhost:5232", "Base URL of the CalDAV server. Defaults to 42W's built-in in-process server.") +
         "</div><div>" +
         field("Calendar path", "caldav.calendar_path", "text", "/fortytwowatts/energy/", "Collection 42W reads events from.") +
         "</div></div>" +
@@ -130,16 +130,6 @@
           if (!d.enabled) {
             ind.className = "ha-status-indicator ha-off";
             ind.textContent = "○  disabled in config";
-            return;
-          }
-          if (d.available === false) {
-            ind.className = "ha-status-indicator ha-warn";
-            ind.textContent = (d.unavailable_reason === "ha-addon")
-              ? "⚠  Not available as a Home Assistant add-on. The calendar needs the Radicale sidecar (GPLv3) running in its own container, which the single-container add-on can't provide. See docs/caldav-integration.md."
-              : "⚠  Calendar unavailable in this install.";
-            if (credsEl) credsEl.textContent = "";
-            if (urlsEl) urlsEl.textContent = "";
-            if (qrEl) qrEl.textContent = "";
             return;
           }
           if (d.reachable) {

@@ -1,18 +1,17 @@
-// Package caldavserver is a native, in-process CalDAV server (PROTOTYPE) built
-// on github.com/emersion/go-webdav (MIT). It is an alternative to the bundled
-// Radicale sidecar (GPLv3): being pure-Go and in-process, it ships in the
-// single 42W binary and needs no second container — so the calendar feature
-// (#498) can run in a single-container Home Assistant add-on too, and the GPL
-// arm's-length constraint disappears.
+// Package caldavserver is 42W's native, in-process CalDAV server built on
+// github.com/emersion/go-webdav (MIT). Being pure-Go and in-process, it ships
+// in the single 42W binary and needs no second container — so the calendar
+// feature (#498) runs everywhere 42W does, including a single-container Home
+// Assistant add-on.
 //
-// Selected with `caldav.server: native`. 42W's existing calendar client
-// (internal/calendar) still talks CalDAV over localhost, so the inbound/outbound
-// intent logic is unchanged — this just replaces "what the client connects to".
+// 42W's calendar client (internal/calendar) talks CalDAV to it over localhost,
+// so the inbound/outbound intent logic is independent of transport.
 //
 // Objects persist via a Store (state.db in production; in-memory for tests).
-// Remaining gaps before it's a full Radicale replacement: no server-side
-// recurrence expansion, and interop is verified against 42W's own go-webdav
-// client rather than the full matrix of iOS / Google / Thunderbird.
+// Recurring events ARE expanded server-side per RFC 4791 CALDAV:expand (see
+// expand.go). Known limits: a single principal and minimal MKCALENDAR/sync
+// semantics; interop is verified against 42W's own go-webdav client rather than
+// the full matrix of iOS / Google / Thunderbird.
 package caldavserver
 
 import (
@@ -26,8 +25,7 @@ import (
 )
 
 // Server is the native CalDAV HTTP server: a go-webdav caldav.Handler behind
-// HTTP Basic auth, on its own listener (default :5232, same port Radicale would
-// use — you run one or the other).
+// HTTP Basic auth, on its own listener (default :5232).
 type Server struct {
 	addr    string
 	httpSrv *http.Server

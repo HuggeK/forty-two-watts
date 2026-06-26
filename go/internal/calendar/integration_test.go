@@ -1,7 +1,7 @@
 //go:build caldav_it
 
-// Integration test against a real CalDAV server (Radicale). Excluded from the
-// normal build; run with a server available:
+// Integration test against an external CalDAV server. Excluded from the
+// normal build; run with a server available (point it at any CalDAV URL):
 //
 //	FTW_CALDAV_IT_URL=http://localhost:5232 \
 //	FTW_CALDAV_IT_USER=ituser FTW_CALDAV_IT_PASS=itpass \

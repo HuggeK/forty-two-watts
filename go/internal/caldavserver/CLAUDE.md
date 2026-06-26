@@ -1,18 +1,15 @@
-# caldavserver — native in-process CalDAV server (#498, PROTOTYPE)
+# caldavserver — native in-process CalDAV server (#498)
 
 ## What it does
 
-A pure-Go CalDAV server built on `github.com/emersion/go-webdav` (**MIT**), an
-alternative to the bundled Radicale sidecar (GPLv3). Selected with
-`caldav.server: native`. Because it's in-process it ships in the single 42W
-binary — no second container — so the calendar feature can run in a
-single-container Home Assistant add-on, and the GPL arm's-length constraint
-disappears.
+42W's own pure-Go CalDAV server, built on `github.com/emersion/go-webdav`
+(**MIT**). It is the **only** CalDAV server 42W uses — there is no sidecar.
+Being in-process it ships in the single 42W binary, so the calendar feature
+runs everywhere 42W does, including a single-container Home Assistant add-on.
 
-42W's existing calendar client (`internal/calendar`) still talks CalDAV over
-localhost, so inbound/outbound intent logic is unchanged — this only replaces
-*what the client connects to*. Both sides authenticate with the managed
-credential.
+42W's calendar client (`internal/calendar`) talks CalDAV to it over localhost,
+so the inbound/outbound intent logic is independent of transport. Both sides
+authenticate with the managed credential.
 
 ## Files
 
@@ -21,32 +18,37 @@ credential.
   `basicAuth` is constant-time and fail-closed on an empty password.
 - `backend.go` — `backend`: a `caldav.Backend` that (de)serializes iCal +
   computes ETags and delegates persistence to a `Store`. `QueryCalendarObjects`
-  reuses `caldav.Filter` for query matching.
+  runs `caldav.Filter` then expands recurrences (see below).
+- `expand.go` — RFC 4791 `CALDAV:expand`. go-webdav v0.7 drops the `<expand>`
+  element before the backend sees it, so the expansion window comes from the
+  comp-filter time-range the client sends alongside it (`filterTimeRange`).
+  Recurring masters fan out into per-occurrence instances (each with a
+  `RECURRENCE-ID`, no `RRULE`) via go-ical's `RecurrenceSet` (rrule-go).
 - `store.go` — the `Store` interface (`*state.Store` satisfies it; objects live
   in the `caldav_objects` / `caldav_calendars` tables) + `NewMemStore` for
   tests / no-DB fallback.
 - `server_test.go` — client↔server round-trip (PUT/REPORT/DELETE), auth, and a
   restart-survival test against a real `state.db`.
+- `expand_test.go` — recurrence expansion (end-to-end through the client + the
+  pure `expandCalendar`).
 
 ## Wired in
 
-`main.go`: when `cfg.CalDAV.ServerMode() == "native"` it starts the server
-(`caldavserver.New`) and is **exempt** from the HA-addon disable
-(`runningAsHAAddon`). The end-to-end test that the real `calendar.Service`
-parses intents from it lives in `internal/calendar/native_e2e_test.go`.
+`main.go`: when `cfg.CalDAV.Enabled` it starts the server (`caldavserver.New`)
+against `state.db`. The end-to-end test that the real `calendar.Service` parses
+intents (including recurring ones) from it lives in
+`internal/calendar/native_e2e_test.go`.
 
-## Remaining gaps (default stays `radicale` until closed)
+## Known limits
 
-- **No server-side recurrence expansion** — recurring events return as their
-  master VEVENT.
-- Single principal; minimal MKCALENDAR/sync semantics. Interop verified against
-  42W's own go-webdav client, not yet against iOS/Google/Thunderbird.
-
-Storage IS durable now (persists in `state.db`).
+- Single principal; minimal MKCALENDAR/sync semantics.
+- Interop verified against 42W's own go-webdav client, not yet the full matrix
+  of iOS / Google / Thunderbird.
+- Recurrence expansion covers RRULE/RDATE/EXDATE; it does not yet honour
+  per-instance `RECURRENCE-ID` override events.
 
 ## What NOT to do
 
-- Don't run it alongside Radicale on the same `:5232` — you pick one
-  (`caldav.server`). Native mode needs no `radicale` compose service.
 - Don't put iCal parsing in `state` — it stays storage-only (`data TEXT`); the
-  backend owns (de)serialization.
+  backend owns (de)serialization. Recurrence math lives in `expand.go`, not in
+  the client.

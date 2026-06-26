@@ -570,7 +570,7 @@ func (s *Store) migrate() error {
 		) STRICT`,
 
 		// CalDAV objects + collections for the native in-process CalDAV server
-		// (#498, caldav.server: native). One row per calendar object (.ics),
+		// (#498). One row per calendar object (.ics),
 		// keyed by its full path; `collection` is the parent collection path so
 		// listing a calendar is an indexed scan. `data` is the raw iCalendar.
 		`CREATE TABLE IF NOT EXISTS caldav_calendars (

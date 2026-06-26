@@ -6,60 +6,58 @@ network.
 
 ## Mental model
 
-There's a CalDAV **server** (where your calendar lives) and 42W's CalDAV
-**client** (which reads/writes it and maps events onto planner machinery). The
-client is always the same; you choose the server with `caldav.server`:
+42W **hosts its own CalDAV server**, in-process, and also runs a CalDAV
+**client** against it:
 
-- **`native` (default)** — 42W hosts CalDAV **itself**, in-process, via
-  [`emersion/go-webdav`](https://github.com/emersion/go-webdav) (MIT). No
-  sidecar, no extra container, objects persisted in `state.db`. Works in a
-  single binary / single container — including a Home Assistant add-on. See
-  `go/internal/caldavserver`.
-- **`radicale`** — the bundled [Radicale](https://radicale.org/) sidecar
-  (GPLv3, separate container). Radicale has more complete protocol support
-  (recurrence expansion, wider client interop), so pick it if you need those
-  today; it can't run in a single-container HA add-on (see *Deploy modes*).
-
-Either way the client talks CalDAV over `localhost`, so everything below is
-identical between the two — only "what it connects to" changes.
+- The **server** (`go/internal/caldavserver`) is pure-Go, built on
+  [`emersion/go-webdav`](https://github.com/emersion/go-webdav) (MIT). It ships
+  inside the single 42W binary — no sidecar, no second container — and persists
+  calendar objects in `state.db`. It binds `:5232` on your LAN so your phone or
+  desktop calendar app can subscribe. Because it's in-process it runs everywhere
+  42W does, **including a single-container Home Assistant add-on**.
+- The **client** (`go/internal/calendar`) polls a collection on that server and
+  maps events onto planner machinery.
 
 ```
- Calendar app ──CalDAV(LAN)──▶  CalDAV server  ◀──poll/write── 42W (internal/calendar)
-   (phone /                     native (default) │ away → loadmodel.ProfileAway
-    Thunderbird)                or Radicale :5232 │ "charge car 80%" → loadpoint target
-                                                  └ EV session ended → write history event
+ Calendar app ──CalDAV(LAN :5232)──▶  42W
+   (phone /                            ├─ caldavserver (in-process, go-webdav)
+    Thunderbird)                       └─ calendar client ──▶ away → loadmodel.ProfileAway
+                                          (poll/write over          "charge car 80%" → loadpoint target
+                                           localhost)               EV session ended → write history event
 ```
 
 Two directions:
 
 - **Inbound** — you create events in your app; 42W reads them as intents.
-- **Outbound** — 42W writes a read-only "EVSE history" calendar you subscribe
-  to (one event per completed charge session).
+- **Outbound** — 42W writes read-only "EVSE history" and "plan" calendars you
+  subscribe to (one event per completed charge session; upcoming
+  charge/discharge windows).
 
 ## Security / network posture
 
-- Radicale listens on **`0.0.0.0:5232`** — i.e. it is reachable from **any
-  device on your home network**, not just loopback. It is **not** forwarded to
-  the internet by the 42W deployment (no port-forward is created) and is
-  **never** routed through the owner-access relay, so it stays on your LAN
-  unless you deliberately forward port `5232` on your router. Off your network
-  it simply doesn't sync, then catches up when you're home.
+- The CalDAV server listens on **`:5232`** (all interfaces) — i.e. it is
+  reachable from **any device on your home network**, not just loopback, so
+  phones can sync. It is **not** forwarded to the internet by the 42W deployment
+  (no port-forward is created) and is **never** routed through the owner-access
+  relay, so it stays on your LAN unless you deliberately forward port `5232` on
+  your router. Off your network it simply doesn't sync, then catches up when
+  you're home.
 - Authentication is HTTP Basic over **plain HTTP** — credentials are
   base64-encoded (not encrypted). This is standard for self-hosted CalDAV on a
   **trusted** home network. If your LAN has guest WiFi or untrusted IoT
   devices, treat this as a weaker boundary: use a strong password, leave the
-  feature off (it is opt-in), or put Radicale behind a TLS reverse proxy.
+  feature off (it is opt-in), or put 42W behind a TLS reverse proxy. The server
+  fails closed — an empty configured password rejects every request.
 - The 42W API surface for this feature (`/api/caldav/*`) is behind the normal
-  owner-auth gate; only the Radicale port itself is on the open LAN.
-- DoS hardening: 42W caps the CalDAV response it will read (25 MiB) and the
-  number of events it parses per poll (10k), and bounds each poll with a
+  owner-auth gate; only the CalDAV port itself is on the open LAN.
+- DoS hardening: 42W's client caps the CalDAV response it will read (25 MiB) and
+  the number of events it parses per poll (10k), and bounds each poll with a
   timeout, so a hostile/MITM'd server can't exhaust the Pi or stall the calendar
-  loop. The control loop runs in separate goroutines and is never blocked by a
-  slow calendar server.
+  loop. The control loop runs in separate goroutines and is never blocked.
 
-## Setup (native server — the default)
+## Setup
 
-No sidecar needed. 42W **manages the credential for you**
+No sidecar, nothing to install. 42W **manages the credential for you**
 (`caldav.manage_credentials: true`): on first enable it generates a random
 password and shows the username + password (with a QR) in **Settings →
 Calendar**.
@@ -72,21 +70,11 @@ Calendar**.
    `http://<host-ip>:5232/fortytwowatts/energy/` (the tab rewrites `localhost`
    to the dashboard's host for you).
 
-That's the whole flow — no extra container.
+That's the whole flow.
 
-## Setup (Radicale sidecar — `server: radicale`)
-
-Set `caldav.server: radicale`, then:
-
-1. Start the sidecar: `docker compose --profile calendar up -d`.
-2. Credentials work the same (42W writes the Radicale htpasswd into the shared
-   `./radicale/config` mount). Tick *Enabled* and read the **Calendar account**
-   panel as above.
-
-> **Manual Radicale credentials.** Set `caldav.manage_credentials: false`, run
-> `cp radicale/config/users.example radicale/config/users && htpasswd -B
-> radicale/config/users fortytwowatts`, and enter the same username/password in
-> the Calendar tab.
+> **Manual credentials.** Set `caldav.manage_credentials: false` and put your
+> own `password` in the `caldav:` block (stored in `state.db`, not `config.yaml`
+> — see below). The server authenticates against it.
 
 ## Writing intents (title keywords)
 
@@ -99,6 +87,11 @@ Events are classified by case-insensitive keyword in the **title**:
 
 Keyword lists (`away_keywords`, `ev_keywords`) are configurable for other
 languages. What 42W parsed is visible at `GET /api/caldav/status`.
+
+**Recurring events work.** A weekly *Away* or a daily *Charge car* expands into
+its individual occurrences server-side (RFC 4791 `CALDAV:expand`, via
+`caldavserver/expand.go`), so the planner sees every occurrence inside its
+horizon — not just the first.
 
 ## EVSE history (outbound)
 
@@ -131,64 +124,55 @@ collections are kept distinct so 42W never re-reads its own output as input.
 See the `caldav:` block in `config.example.yaml`. The password is stored in
 `state.db` (key `caldav_password`), never written to `config.yaml`. URL,
 credentials, keywords and intervals hot-reload; toggling `enabled` needs a
-restart.
+restart. `listen` (default `:5232`) sets the server's bind address.
 
 ## Deploy modes & Home Assistant
 
-**The default `server: native` works in every deploy mode** — docker-compose,
-raw binary, and a single-container Home Assistant add-on — because it's
-in-process and pure-Go (MIT). Nothing extra to install; objects persist in
-`state.db`. Its only current limitation is **no server-side recurrence
-expansion** (a recurring event shows only its first occurrence) and that broad
-calendar-app interop isn't fully proven yet.
+The CalDAV server is in-process and pure-Go (MIT), so it works in **every**
+deploy mode with nothing extra to install:
 
-`server: radicale` is the opt-in alternative when you need recurrence /
-wider client interop today. Radicale is **GPLv3**, so 42W keeps it strictly
-**arm's length** — a separate container reached only over the CalDAV network
-protocol — which keeps 42W cleanly separable and permissively licensable
-(MIT/Apache-2.0); the compose file only *references* the public image, never
-bundling or redistributing it.
+- **Raspberry Pi image / raw binary / docker-compose (host networking):** the
+  server binds `:5232` directly on the host. Subscribe at
+  `http://<host-ip>:5232/…`.
+- **docker-compose on macOS (bridge networking):** the main service publishes
+  `5232:5232` (see `docker-compose.macos.yml`) so phones reach it; keep
+  `caldav.url: http://localhost:5232` (the in-container loopback).
+- **Home Assistant add-on (single container):** it just works — there is no
+  sidecar at all, so no deploy-mode is gated off.
 
-The catch with Radicale: a sidecar can't live inside a **single-container HA
-add-on**. So 42W detects the add-on (`runningAsHAAddon()` — `FTW_HA_ADDON=1`,
-or a Supervisor token / `/data/options.json` fallback) and, **in `radicale`
-mode only**, disables the calendar with an explanation in the Settings tab. The
-fix there is simply to use `server: native` (the default), which is exempt.
-`FTW_CALDAV_FORCE=1` re-enables `radicale` mode for a *separate* Radicale add-on
-you point `caldav.url` at.
-
-**TODO (#498):** add server-side recurrence expansion to the native server
-(using the vendored `teambition/rrule-go`) and verify interop against iOS /
-Google / Thunderbird, then drop the Radicale option if it's no longer needed.
-Tracking with the add-on maintainer (`erikarenhill`).
+Objects persist in `state.db`, so events survive restarts and image upgrades.
 
 ## Implementation
 
+- `go/internal/caldavserver` — the native server: a go-webdav `caldav.Handler`
+  (`server.go`) + a `state.db`-backed `caldav.Backend` (`backend.go`) +
+  server-side recurrence expansion (`expand.go`).
 - `go/internal/calendar` — CalDAV client poll loop (`service.go`), title→intent
-  parser (`parse.go`), EVSE session detector + writer (`history.go`).
+  parser (`parse.go`), EVSE session detector + writer (`history.go`), plan
+  reconciler (`plan.go`).
 - Inbound wiring (`go/cmd/forty-two-watts/main.go`): away intervals drive
   `loadmodel.SetProfile` (live) + an away-aware `mpc.Service.Load` predictor
   (horizon); EV deadlines call `loadpoint.Manager.SetTarget`.
-- `GET /api/caldav/status` (`go/internal/api/api_caldav.go`) backs the
-  Settings tab.
-- Native server (`server: native`, default): `go/internal/caldavserver` — a
-  go-webdav `caldav.Handler` + a `state.db`-backed `caldav.Backend`.
-- Deploy: optional `radicale` service in `docker-compose.yml` (profile
-  `calendar`) + `radicale/config/`, used only when `server: radicale`.
+- `GET /api/caldav/status` + `GET /api/caldav/credentials`
+  (`go/internal/api/api_caldav.go`) back the Settings tab.
 
 ### Third-party libraries
 
 The CalDAV stack is built entirely on **Emerson Tan's `emersion/*` libraries**
-(all **MIT**-licensed, pure Go — no CGo):
+(all **MIT**-licensed, pure Go — no CGo), which keep 42W a single permissively
+licensed static binary:
 
 - [`github.com/emersion/go-webdav`](https://github.com/emersion/go-webdav) — the
-  CalDAV **client** (used in every mode to poll/read/write) **and** the CalDAV
-  **server** (`caldav` subpackage) that powers `server: native`.
+  CalDAV **client** (poll/read/write) **and** the CalDAV **server**
+  (`caldav` subpackage) behind the in-process native server.
 - [`github.com/emersion/go-ical`](https://github.com/emersion/go-ical) —
-  iCalendar (RFC 5545) parsing + encoding.
+  iCalendar (RFC 5545) parsing + encoding, and the recurrence set used by
+  `expand.go`.
 - [`github.com/teambition/rrule-go`](https://github.com/teambition/rrule-go) —
-  pulled in transitively via go-ical; the future home of native recurrence
-  expansion.
+  RRULE/RDATE/EXDATE expansion (reached via go-ical's `RecurrenceSet`).
 
-These keep 42W a single static binary and are why the native server is
-permissively licensable (unlike the GPLv3 Radicale sidecar).
+### Future work
+
+- Honour per-instance `RECURRENCE-ID` override events during expansion.
+- Verify interop against the full matrix of iOS / Google / Thunderbird (today
+  it's proven against 42W's own go-webdav client).

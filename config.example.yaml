@@ -98,29 +98,23 @@ homeassistant:
   password: homeems
   publish_interval_s: 5
 
-# Calendar-based planner constraints (#498). 42W reads a CalDAV calendar
-# (served by the bundled, LAN-only Radicale sidecar) and turns events into
-# planner intents: "Away"/"Vacation" → away load profile; "Charge car 80%"
-# → EV target SoC by the event time. It also writes an EVSE usage-history
-# calendar. Opt-in + fail-soft. Start the sidecar with
-# `docker compose --profile calendar up -d`. password is stored in state.db.
+# Calendar-based planner constraints (#498). 42W hosts its OWN in-process,
+# pure-Go CalDAV server (emersion/go-webdav, MIT — no sidecar, works in a
+# single container incl. a Home Assistant add-on; objects persist in state.db)
+# and turns the events you add into planner intents: "Away"/"Vacation" → away
+# load profile; "Charge car 80%" → EV target SoC by the event time. It also
+# writes EVSE usage-history and forward-looking plan calendars you subscribe
+# to. Recurring events are expanded server-side. Opt-in + fail-soft; the
+# password is stored in state.db. See docs/caldav-integration.md.
 caldav:
   enabled: false
-  # server: native (DEFAULT) → 42W runs an in-process pure-Go CalDAV server
-  # (emersion/go-webdav, MIT) — no sidecar, works in a single container incl. a
-  # Home Assistant add-on; objects persist in state.db. native does NOT yet
-  # expand recurring events (a recurring event shows only its first occurrence).
-  # server: radicale → use the bundled Radicale sidecar instead (GPLv3, separate
-  # container) if you need recurring events or broad calendar-app interop today.
-  server: native
-  # listen: ":5232"          # bind address for the native server
+  # listen: ":5232"          # bind address for the in-process CalDAV server
   url: http://localhost:5232
   username: fortytwowatts
-  # manage_credentials (default true): 42W generates the password and writes the
-  # Radicale htpasswd itself, then shows it (with a QR) in Settings → Calendar.
-  # Set false to manage radicale/config/users by hand and set `password` here.
+  # manage_credentials (default true): 42W generates the password and the
+  # in-process server authenticates against it, then shows it (with a QR) in
+  # Settings → Calendar. Set false to set `password` here by hand.
   manage_credentials: true
-  # htpasswd_path: /app/radicale-config/users   # where 42W writes the credential
   password: ""
   calendar_path: /fortytwowatts/energy/
   poll_interval_s: 300

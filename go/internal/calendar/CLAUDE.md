@@ -2,10 +2,11 @@
 
 ## What it does
 
-Polls a CalDAV calendar collection (served by the bundled **Radicale**
-sidecar, or any CalDAV server) and maps events into planner intents. 42W is
-a **client only** — it does not host CalDAV. Opt-in (`config.CalDAV.Enabled`)
-and fail-soft: an unreachable server never blocks control.
+Polls a CalDAV calendar collection — served by 42W's own in-process native
+CalDAV server (`internal/caldavserver`) — and maps events into planner intents.
+This package is the **client**; the server is a sibling package. Opt-in
+(`config.CalDAV.Enabled`) and fail-soft: an unreachable server never blocks
+control.
 
 Two intents, both routed onto **existing** machinery:
 
@@ -24,12 +25,14 @@ windows (`plan.go`, reconciled each cycle — PUT changed, DELETE stale).
   Keyword substring match (case-insensitive); `(\d{1,3})%` → target SoC;
   `lp:<id>` → explicit loadpoint. EV checked before away (more specific).
 - `service.go` — `Service`: poll loop, CalDAV fetch (calendar-query REPORT
-  with server-side `Expand`; response-size + event-count + timeout DoS caps),
-  `apply` (profile switch + EV target), `IsAwayAt`, `Status`, `Credentials`.
-- `provision.go` — managed credential: `GenerateToken` + `provisionHtpasswd`
-  (writes `user:bcrypt` to the Radicale htpasswd; fail-soft if the shared mount
-  is absent). main.go generates the password; the Settings tab reveals it (+QR).
-- `doc.go`, `*_test.go`.
+  with a time-range filter the server expands recurrences within; response-size
+  + event-count + timeout DoS caps), `apply` (profile switch + EV target),
+  `IsAwayAt`, `Status`, `Credentials`.
+- `provision.go` — `GenerateToken`: mints the managed credential (main.go
+  persists it to state.db; the native server authenticates against it and the
+  Settings tab reveals it +QR).
+- `doc.go`, `*_test.go` (incl. `native_e2e_test.go`: the whole feature against
+  the in-process server, including a recurring "Away" event).
 
 ## Public API
 
@@ -42,15 +45,15 @@ windows (`plan.go`, reconciled each cycle — PUT changed, DELETE stale).
 
 ## How it talks to neighbors
 
-- main.go constructs it after `loadSvc` + `lpMgr`, wraps `mpcSvc.Load` with
-  `IsAwayAt`+`loadSvc.PredictWith(t, ProfileAway)`, and registers a
-  config-reload hook. `api.Deps.CalDAV` exposes `Status()`.
-- Recurrences expand server-side (`caldav.CalendarExpandRequest`) — **no RRULE
-  math here**.
+- main.go starts the `caldavserver` first, then constructs this client after
+  `loadSvc` + `lpMgr`, wraps `mpcSvc.Load` with `IsAwayAt`+
+  `loadSvc.PredictWith(t, ProfileAway)`, and registers a config-reload hook.
+  `api.Deps.CalDAV` exposes `Status()`.
+- Recurrences expand **server-side** in `caldavserver` — **no RRULE math here**.
 
 ## What NOT to do
 
-- Do not host CalDAV here — Radicale owns server correctness; this is a client.
+- Do not host CalDAV here — that's `internal/caldavserver`; this is the client.
 - Do not block control on a poll error — record it in `Status`, keep last-good.
 - Do not clear a manual/UI EV target when no calendar event is upcoming.
 - Away profile switch fires on transition only (idempotent); leaving an away
