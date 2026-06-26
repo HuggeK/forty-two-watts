@@ -52,7 +52,7 @@
 
 DRIVER = {
   id           = "nibe-local",
-  name         = "NIBE S-series (local REST API)",
+  name         = "NIBE REST API S-series",
   manufacturer = "NIBE",
   version      = "1.0.0",
   protocols    = { "http" },
@@ -175,6 +175,17 @@ end
 local function to_watts(value, unit)
     if unit == "kW" then return value * 1000.0, "W" end
     return value, (unit ~= "" and unit or "W")
+end
+
+-- The NIBE Modbus register id for a point (metadata.modbusRegisterID), formatted
+-- as a string for host.emit_metric's optional 4th (register) arg. Surfaced in
+-- the per-driver "all signals" detail view so each signal shows its source
+-- register. 0 / absent means the point has no Modbus mapping (menu-only) — emit
+-- "" so the column stays blank rather than showing a misleading "0".
+local function register_str(m)
+    local r = tonumber(m.modbusRegisterID)
+    if r and r ~= 0 then return string.format("%d", r) end
+    return ""
 end
 
 -- Build the id -> canonical-metric lookup. Each headline's id is resolved
@@ -336,19 +347,20 @@ function driver_poll()
                 if div == 0 then div = 1 end
                 local scaled = raw / div
                 local unit = m.unit or ""
+                local reg = register_str(m)
                 local canon = CANON[tostring(id)]
                 if canon then
                     if canon.watts then
                         local w, u = to_watts(scaled, unit)
-                        host.emit_metric(canon.name, w, u)
+                        host.emit_metric(canon.name, w, u, reg)
                     else
-                        host.emit_metric(canon.name, scaled, unit)
+                        host.emit_metric(canon.name, scaled, unit, reg)
                     end
                 else
                     local name = sanitize_metric_name(pt.title, id)
                     if seen[name] then name = name .. "_" .. tostring(id) end
                     seen[name] = true
-                    host.emit_metric(name, scaled, unit)
+                    host.emit_metric(name, scaled, unit, reg)
                 end
             end
         end

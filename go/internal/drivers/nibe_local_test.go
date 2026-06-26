@@ -63,6 +63,13 @@ func TestNibeLocalEmitsTelemetry(t *testing.T) {
 		"28393": point("Tot. consump­tion", "u32", "kWh", 10, 53999),               // hp_energy_consumed_kwh 5399.9
 	}
 
+	// Attach a Modbus register id to each point's metadata (the pump reports
+	// modbusRegisterID per point); the driver threads it into the live snapshot.
+	// Injected here so the soft-hyphen titles above stay byte-for-byte untouched.
+	for id, reg := range map[string]int{"1801": 1048, "4": 1, "11": 8, "8": 5, "28393": 2166} {
+		points[id].(map[string]any)["metadata"].(map[string]any)["modbusRegisterID"] = reg
+	}
+
 	var sawAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawAuth = r.Header.Get("Authorization")
@@ -128,6 +135,22 @@ func TestNibeLocalEmitsTelemetry(t *testing.T) {
 		}
 		if !approxEq(v, want) {
 			t.Errorf("metric %s = %v, want %v", name, v, want)
+		}
+	}
+
+	// The Modbus register id rides along into the live snapshot so the
+	// per-driver "all signals" detail view can show each signal's source
+	// register — for canonical aliases (hp_power_w) and auto-named metrics alike.
+	regByName := map[string]string{}
+	for _, m := range tel.LatestMetricsByDriver("nibe") {
+		regByName[m.Name] = m.Register
+	}
+	for name, want := range map[string]string{
+		"hp_power_w":         "1048", // canonical alias keeps its point's register
+		"hp_supply_line_bt2": "5",    // auto-named metric
+	} {
+		if regByName[name] != want {
+			t.Errorf("metric %s register = %q, want %q", name, regByName[name], want)
 		}
 	}
 

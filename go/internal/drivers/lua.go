@@ -271,18 +271,21 @@ func registerHost(L *lua.LState, env *HostEnv) {
 		return 0
 	}))
 
-	// host.emit_metric("battery_temp_c", 23.5 [, "°C"]) — record an arbitrary
-	// scalar diagnostic into the long-format TS DB. Use for anything that
-	// doesn't fit the structured pv/battery/meter shape: temperatures, DC
+	// host.emit_metric("battery_temp_c", 23.5 [, "°C" [, "40004"]]) — record an
+	// arbitrary scalar diagnostic into the long-format TS DB. Use for anything
+	// that doesn't fit the structured pv/battery/meter shape: temperatures, DC
 	// voltages, MPPT currents, grid frequency, inverter heat-sink, etc.
 	// The metric name is the column name in the time-series — pick a stable
-	// snake_case identifier with the unit as a suffix. The optional 3rd arg
-	// is a display unit (e.g. "°C", "Hz", "kW") the UI uses to group + label.
+	// snake_case identifier with the unit as a suffix. The optional 3rd arg is a
+	// display unit (e.g. "°C", "Hz", "kW") the UI uses to group + label; the
+	// optional 4th arg is a source register/address (e.g. a Modbus register id)
+	// surfaced in the per-driver detail view.
 	host.RawSetString("emit_metric", L.NewFunction(func(L *lua.LState) int {
 		name := L.CheckString(1)
 		val := float64(L.CheckNumber(2))
 		unit := L.OptString(3, "")
-		if err := env.emitMetric(name, val, unit); err != nil {
+		register := L.OptString(4, "")
+		if err := env.emitMetric(name, val, unit, register); err != nil {
 			L.Push(lua.LString(err.Error()))
 			return 1
 		}
