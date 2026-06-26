@@ -74,9 +74,16 @@ install -d -m 0755                    "${ROOTFS_DIR}/home/ftw/forty-two-watts"
 install -d -m 0755 -o 100 -g 101      "${ROOTFS_DIR}/home/ftw/forty-two-watts/data"
 install -d -m 0755                    "${ROOTFS_DIR}/home/ftw/forty-two-watts/mosquitto"
 install -d -m 0755                    "${ROOTFS_DIR}/home/ftw/forty-two-watts/mosquitto/config"
+# Radicale calendar sidecar (#498). Opt-in (compose profile "calendar"); the
+# service stays off until the operator copies users.example → users and sets a
+# password, so first boot is unaffected.
+install -d -m 0755                    "${ROOTFS_DIR}/home/ftw/forty-two-watts/radicale"
+install -d -m 0755                    "${ROOTFS_DIR}/home/ftw/forty-two-watts/radicale/config"
 
 install -m 0644 files/docker-compose.yml    "${ROOTFS_DIR}/home/ftw/forty-two-watts/docker-compose.yml"
 install -m 0644 files/mosquitto.conf        "${ROOTFS_DIR}/home/ftw/forty-two-watts/mosquitto/config/mosquitto.conf"
+install -m 0644 files/radicale-config         "${ROOTFS_DIR}/home/ftw/forty-two-watts/radicale/config/config"
+install -m 0644 files/radicale-users.example  "${ROOTFS_DIR}/home/ftw/forty-two-watts/radicale/config/users.example"
 
 install -m 0755 files/firstboot.sh          "${ROOTFS_DIR}/usr/local/sbin/ftw-firstboot"
 install -m 0644 files/firstboot.service     "${ROOTFS_DIR}/etc/systemd/system/ftw-firstboot.service"

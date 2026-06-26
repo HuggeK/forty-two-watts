@@ -116,6 +116,35 @@ services:
       - ./mosquitto/config:/mosquitto/config:ro
       - mosquitto-data:/mosquitto/data
 
+  # ---------------------------------------------------------------------
+  # CalDAV server (Radicale) — calendar-based planner constraints (#498)
+  #
+  # Opt-in: only starts with `docker compose -f docker-compose.macos.yml
+  # --profile calendar up -d`. The main app reaches it by SERVICE NAME over
+  # the compose network, so on macOS set `caldav.url: http://radicale:5232`
+  # in config.yaml (NOT localhost). Your phone/desktop calendar app reaches
+  # it at http://<mac-ip>:5232/ via the published port below.
+  #
+  # LAN-only by design (never routed through the owner relay). Credentials:
+  #   cp radicale/config/users.example radicale/config/users
+  #   htpasswd -B radicale/config/users fortytwowatts
+  # then enter the same creds in Settings → Calendar. See
+  # docs/caldav-integration.md.
+  # ---------------------------------------------------------------------
+  radicale:
+    image: tomsquest/docker-radicale:3.2.3.0
+    container_name: forty-two-watts-radicale
+    restart: unless-stopped
+    profiles: ["calendar"]
+
+    ports:
+      - "5232:5232"
+
+    volumes:
+      - ./radicale/config:/config:ro
+      - radicale-data:/data
+
 volumes:
   update-ipc:
   mosquitto-data:
+  radicale-data:
