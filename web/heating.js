@@ -25,38 +25,89 @@
     return fetch(path, opts);
   }
 
-  // hp_* metric → display label + formatter. Order here is render order.
-  var METRICS = [
-    { key: 'hp_power_w', label: 'Compressor', fmt: fmtPower },
-    { key: 'hp_hw_top_temp_c', label: 'Hot water', fmt: fmtTemp },
-    { key: 'hp_indoor_temp_c', label: 'Indoor', fmt: fmtTemp },
-    { key: 'hp_outdoor_temp_c', label: 'Outdoor', fmt: fmtTemp },
-  ];
-
+  // ── Card formatters ──────────────────────────────────────────────
   function fmtPower(v) {
     if (v == null) return '—';
     if (Math.abs(v) >= 1000) return (v / 1000).toFixed(2) + ' kW';
     return Math.round(v) + ' W';
   }
-  function fmtTemp(v) {
-    if (v == null) return '—';
-    return v.toFixed(1) + ' °C';
-  }
+  function fmtTemp(v)   { return v == null ? '—' : v.toFixed(1) + ' °C'; }
+  function fmtKW(v)     { return v == null ? '—' : v.toFixed(2) + ' kW'; }
+  function fmtHz(v)     { return v == null ? '—' : Math.round(v) + ' Hz'; }
+  function fmtAmp(v)    { return v == null ? '—' : v.toFixed(1) + ' A'; }
+  function fmtPct(v)    { return v == null ? '—' : Math.round(v) + ' %'; }
+  function fmtFlow(v)   { return v == null ? '—' : Math.round(v) + ' m³/h'; }
+  function fmtDM(v)     { return v == null ? '—' : Math.round(v) + ' DM'; }
+  function fmtKwh(v)    { return v == null ? '—' : Math.round(v).toLocaleString('sv-SE') + ' kWh'; }
+  function fmtRaw(v)    { return v == null ? '—' : String(Math.round(v * 100) / 100); }
+  function fmtOffset(v) { return v == null ? '—' : (v > 0 ? '+' : '') + Math.round(v); }
+  var PRIO = { 0: 'av', 10: 'av', 20: 'varmvatten', 30: 'värme', 40: 'pool', 60: 'kyla' };
+  function fmtPrio(v) { if (v == null) return '—'; var n = Math.round(v); return n + (PRIO[n] ? ' · ' + PRIO[n] : ''); }
+  function fmtVent(v) { if (v == null) return '—'; var n = Math.round(v); return n === 0 ? 'Normal' : String(n); }
+
+  // ── Card layout: grouped tiles. Each item = { key (hp_* metric), label,
+  // optional sensor designation (BT21 …), formatter, info (hover tooltip on
+  // the ⓘ icon) }. Render order = array order. The detail pop-up still lists
+  // ALL ~960 signals; this is the curated at-a-glance set.
+  var GROUPS = [
+    { title: 'Effekt & el', items: [
+      { key: 'hp_energy_log_current_power_consumption', label: 'Total effekt nu', fmt: fmtKW, info: 'Hela värmepumpens momentana elförbrukning just nu — kompressor + fläkt + cirkulationspumpar + elektronik.' },
+      { key: 'hp_power_w', label: 'Kompressor', fmt: fmtPower, info: 'Effekt till enbart kompressorn. 0 W när kompressorn står still — pumpen drar ändå el (se Total effekt nu).' },
+      { key: 'hp_power_internal_additional_heat', label: 'Intern tillsats', fmt: fmtKW, info: 'Effekt till den interna elpatronen (tillskottsvärme). 0 när bara kompressorn jobbar.' },
+      { key: 'hp_compressor_frequency_current', label: 'Kompr.frekvens', fmt: fmtHz, info: 'Kompressorns frekvens/varvtal just nu. 0 Hz = kompressorn står still.' },
+      { key: 'hp_current_be1', label: 'Ström', sensor: 'BE1', fmt: fmtAmp, info: 'Uppmätt ström på fas 1 (strömtransformator BE1). Används för effektvakt/säkringsskydd.' },
+      { key: 'hp_current_be2', label: 'Ström', sensor: 'BE2', fmt: fmtAmp, info: 'Uppmätt ström på fas 2 (BE2).' },
+      { key: 'hp_current_be3', label: 'Ström', sensor: 'BE3', fmt: fmtAmp, info: 'Uppmätt ström på fas 3 (BE3).' },
+    ] },
+    { title: 'Temperaturer', items: [
+      { key: 'hp_hw_top_temp_c', label: 'Varmvatten topp', sensor: 'BT7', fmt: fmtTemp, info: 'Temperatur högst upp i varmvattenberedaren — det du får först ur kranen.' },
+      { key: 'hp_hot_water_charging_bt6', label: 'VV laddning', sensor: 'BT6', fmt: fmtTemp, info: 'Styrande givare för varmvattenladdning — avgör när tanken är fulladdad.' },
+      { key: 'hp_hot_water_start_bt5', label: 'VV start', sensor: 'BT5', fmt: fmtTemp, info: 'Startgivare för varmvatten — startar ny laddning när den faller under startvärdet.' },
+      { key: 'hp_supply_line_bt2', label: 'Framledning', sensor: 'BT2', fmt: fmtTemp, info: 'Temperatur på vattnet UT till värmesystemet (framledning).' },
+      { key: 'hp_return_line_bt3', label: 'Returledning', sensor: 'BT3', fmt: fmtTemp, info: 'Temperatur på vattnet TILLBAKA från värmesystemet (retur).' },
+      { key: 'hp_calculated_supply_climate_system_1', label: 'Ber. framledning', fmt: fmtTemp, info: 'Beräknad (önskad) framledning som styrsystemet räknat fram ur värmekurvan.' },
+      { key: 'hp_fr_nluft_bt20', label: 'Frånluft', sensor: 'BT20', fmt: fmtTemp, info: 'Ventilationsluften som sugs ut från rummen — värmepumpens värmekälla (in i förångaren).' },
+      { key: 'hp_avluft_bt21', label: 'Avluft', sensor: 'BT21', fmt: fmtTemp, info: 'Luften efter värmeåtervinning, på väg ut ur huset. Frånluft − avluft = återvunnen värme.' },
+      { key: 'hp_outdoor_temp_c', label: 'Utomhus', sensor: 'BT1', fmt: fmtTemp, info: 'Utomhustemperatur (BT1) — styr värmekurvan.' },
+    ] },
+    { title: 'Ventilation', items: [
+      { key: 'hp_ventilation_mode', label: 'Ventilationsläge', fmt: fmtVent, info: 'Aktivt ventilationsläge. 0 = normal.' },
+      { key: 'hp_exhaust_air_fan_speed_gq2', label: 'Fläkthastighet', sensor: 'GQ2', fmt: fmtPct, info: 'Frånluftsfläktens varvtal just nu. Normal = 54 %; lägre (t.ex. 30 %) = reducerad ventilation (hastighet 2).' },
+      { key: 'hp_real_air_flow', label: 'Luftflöde', fmt: fmtFlow, info: 'Uppmätt luftflöde genom aggregatet.' },
+    ] },
+    { title: 'Drift', items: [
+      { key: 'hp_priority', label: 'Prio', fmt: fmtPrio, info: 'Vad kompressorn prioriterar just nu: 10 = av, 20 = varmvatten, 30 = värme, 40 = pool, 60 = kyla.' },
+      { key: 'hp_degree_minutes', label: 'Gradminuter', fmt: fmtDM, info: 'Värmeunderskott integrerat över tid. Når det startgränsen startar kompressorn. 0 = inget underskott (värme avstängd på sommaren).' },
+      { key: 'hp_heating_medium_pump_speed_gp1', label: 'Värmebärarpump', sensor: 'GP1', fmt: fmtPct, info: 'Cirkulationspumpens (GP1) varvtal i värmesystemet.' },
+      { key: 'hp_heating_curve_climate_system_1', label: 'Värmekurva', fmt: fmtRaw, info: 'Inställd värmekurva (lutning) för klimatsystem 1. Högre = varmare framledning när det är kallt ute.' },
+      { key: 'hp_heating_offset_climate_system_1', label: 'Kurvförskjutning', fmt: fmtOffset, info: 'Parallellförskjutning av värmekurvan — varmare (+) eller kallare (−) överlag.' },
+    ] },
+    { title: 'Energi (totalt)', items: [
+      { key: 'hp_energy_consumed_kwh', label: 'Total förbrukning', fmt: fmtKwh, info: 'Total tillförd el till värmepumpen sedan start (livstidsräknare).' },
+      { key: 'hp_energy_produced_kwh', label: 'Total produktion', fmt: fmtKwh, info: 'Total avgiven värmeenergi sedan start. Produktion ÷ förbrukning ≈ värmefaktor (SCOP).' },
+      { key: 'hp_heating_compressor_only', label: 'Värme (kompr.)', fmt: fmtKwh, info: 'Avgiven värme till uppvärmning, endast från kompressorn (exkl. elpatron).' },
+      { key: 'hp_hot_water_compressor_only', label: 'Varmvatten (kompr.)', fmt: fmtKwh, info: 'Avgiven värme till varmvatten, endast från kompressorn (exkl. elpatron).' },
+    ] },
+  ];
 
   function injectStyles() {
     if (document.getElementById('ftw-heating-styles')) return;
     var css = [
       '#heating-grid{display:flex;flex-direction:column;gap:18px}',
-      '.ftw-hp{display:flex;flex-direction:column;gap:12px}',
+      '.ftw-hp{display:flex;flex-direction:column;gap:16px}',
       '.ftw-hp-clickable{cursor:pointer;border-radius:8px;margin:-6px;padding:6px;transition:background 0.12s}',
       '.ftw-hp-clickable:hover,.ftw-hp-clickable:focus{background:var(--bg-hover,rgba(127,127,127,0.06));outline:none}',
       '.ftw-hp-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px}',
       '.ftw-hp-more{font-family:var(--mono);font-size:0.66rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--accent-e)}',
       '.ftw-hp-name{font-family:var(--mono);font-size:0.72rem;letter-spacing:0.18em;text-transform:uppercase;color:var(--fg-muted)}',
-      '.ftw-hp-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px 18px}',
+      '.ftw-hp-group{display:flex;flex-direction:column;gap:7px}',
+      '.ftw-hp-group-title{font-family:var(--mono);font-size:0.6rem;letter-spacing:0.16em;text-transform:uppercase;color:var(--accent-e)}',
+      '.ftw-hp-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px 18px}',
       '.ftw-hp-tile{display:flex;flex-direction:column;gap:3px}',
-      '.ftw-hp-tile-label{font-family:var(--mono);font-size:0.68rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--fg-muted)}',
-      '.ftw-hp-tile-val{font-family:var(--mono);font-size:1.05rem;font-variant-numeric:tabular-nums;color:var(--fg)}',
+      '.ftw-hp-tile-label{font-family:var(--mono);font-size:0.64rem;letter-spacing:0.08em;text-transform:uppercase;color:var(--fg-muted);display:flex;align-items:baseline;gap:3px;flex-wrap:wrap}',
+      '.ftw-hp-sensor{color:var(--fg-muted);opacity:0.6}',
+      '.ftw-hp-i{cursor:help;color:var(--fg-muted);opacity:0.5;align-self:center}',
+      '.ftw-hp-tile-val{font-family:var(--mono);font-size:1.02rem;font-variant-numeric:tabular-nums;color:var(--fg)}',
       '.ftw-hp-spark{display:flex;flex-direction:column;gap:4px}',
       '.ftw-hp-spark-label{font-family:var(--mono);font-size:0.66rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--fg-muted)}',
       '.ftw-hp-spark svg{width:100%;height:48px;display:block}',
@@ -120,24 +171,32 @@
     });
   }
 
+  function tileHtml(def, m) {
+    var has = Object.prototype.hasOwnProperty.call(m, def.key);
+    var sensor = def.sensor ? ' <span class="ftw-hp-sensor">(' + escapeHtml(def.sensor) + ')</span>' : '';
+    var info = def.info ? ' <span class="ftw-hp-i" role="img" aria-label="info" title="' + escapeHtml(def.info) + '">ⓘ</span>' : '';
+    return '<div class="ftw-hp-tile">' +
+      '<span class="ftw-hp-tile-label">' + escapeHtml(def.label) + sensor + info + '</span>' +
+      '<span class="ftw-hp-tile-val">' + (has ? def.fmt(m[def.key]) : '—') + '</span>' +
+      '</div>';
+  }
+
   function renderPump(name, detail, sparkPoints) {
     var m = metricMap(detail && detail.metrics);
-    var tiles = METRICS.map(function (def) {
-      var has = Object.prototype.hasOwnProperty.call(m, def.key);
-      return '<div class="ftw-hp-tile">' +
-        '<span class="ftw-hp-tile-label">' + def.label + '</span>' +
-        '<span class="ftw-hp-tile-val">' + (has ? def.fmt(m[def.key]) : '—') + '</span>' +
-        '</div>';
+    var groups = GROUPS.map(function (g) {
+      var tiles = g.items.map(function (def) { return tileHtml(def, m); }).join('');
+      return '<div class="ftw-hp-group"><div class="ftw-hp-group-title">' + escapeHtml(g.title) + '</div>' +
+        '<div class="ftw-hp-tiles">' + tiles + '</div></div>';
     }).join('');
     var spark = sparkline(sparkPoints);
     var sparkBlock = spark
-      ? '<div class="ftw-hp-spark"><span class="ftw-hp-spark-label">Compressor power · 24h</span>' + spark + '</div>'
+      ? '<div class="ftw-hp-spark"><span class="ftw-hp-spark-label">Kompressoreffekt · 24h</span>' + spark + '</div>'
       : '';
-    // The whole card is a button into the detail view (all signals grouped).
-    return '<div class="ftw-hp ftw-hp-clickable" data-hp-driver="' + escapeHtml(name) + '" role="button" tabindex="0" title="View all heat-pump signals">' +
+    // The whole card is a button into the detail view (all signals + register).
+    return '<div class="ftw-hp ftw-hp-clickable" data-hp-driver="' + escapeHtml(name) + '" role="button" tabindex="0" title="Visa alla signaler">' +
       '<div class="ftw-hp-head"><span class="ftw-hp-name">' + escapeHtml(name) + '</span>' +
-      '<span class="ftw-hp-more">All signals →</span></div>' +
-      '<div class="ftw-hp-tiles">' + tiles + '</div>' +
+      '<span class="ftw-hp-more">Alla signaler →</span></div>' +
+      groups +
       sparkBlock +
       '</div>';
   }
