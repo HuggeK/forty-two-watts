@@ -402,7 +402,10 @@
       '.ftw-hpd-title{font-family:var(--mono);font-size:0.74rem;letter-spacing:0.18em;text-transform:uppercase;color:var(--fg-muted)}',
       '.ftw-hpd-close{background:none;border:1px solid var(--line);color:var(--fg);border-radius:6px;cursor:pointer;font-size:1rem;line-height:1;padding:4px 9px}',
       '.ftw-hpd-group{margin:16px 0 4px;font-family:var(--mono);font-size:0.68rem;letter-spacing:0.14em;text-transform:uppercase;color:var(--accent-e)}',
-      '.ftw-hpd-row{display:grid;grid-template-columns:1fr auto auto 120px;gap:10px 14px;align-items:center;padding:5px 0;border-bottom:1px solid var(--line-soft,var(--line))}',
+      '.ftw-hpd-item{padding:6px 0;border-bottom:1px solid var(--line-soft,var(--line))}',
+      '.ftw-hpd-row{display:grid;grid-template-columns:1fr auto auto 120px;gap:10px 14px;align-items:center}',
+      '.ftw-hpd-explain{font-size:0.74rem;color:var(--fg-muted);line-height:1.35;margin-top:3px;max-width:66ch}',
+      '.ftw-hpd-explain::before{content:"↳ ";opacity:0.55}',
       '.ftw-hpd-label{color:var(--fg-muted);font-size:0.85rem}',
       '.ftw-hpd-reg{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:0.76rem;color:var(--fg-muted);text-align:right;opacity:0.8}',
       '.ftw-hpd-val{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg);text-align:right}',
@@ -421,6 +424,19 @@
     document.removeEventListener('keydown', onDetailKey);
   }
   function onDetailKey(e) { if (e.key === 'Escape') closeDetail(); }
+
+  // Curated explanations from the card GROUPS, keyed by metric name. Built
+  // once, lazily (GROUPS is defined above at module scope).
+  var _infoByKey = null;
+  function infoForKey(key) {
+    if (!_infoByKey) {
+      _infoByKey = {};
+      GROUPS.forEach(function (g) {
+        (g.items || []).forEach(function (it) { if (it.info) _infoByKey[it.key] = it.info; });
+      });
+    }
+    return _infoByKey[key] || '';
+  }
 
   function openDetail(name) {
     injectDetailStyles();
@@ -456,11 +472,15 @@
         rows.sort(function (a, b) { return a.name < b.name ? -1 : 1; });
         html += '<div class="ftw-hpd-group">' + escapeHtml(g) + '</div>';
         rows.forEach(function (m) {
-          html += '<div class="ftw-hpd-row">' +
+          var explain = infoForKey(m.name) || m.title || '';
+          html += '<div class="ftw-hpd-item">' +
+            '<div class="ftw-hpd-row">' +
             '<span class="ftw-hpd-label">' + escapeHtml(prettyLabel(m.name)) + '</span>' +
             '<span class="ftw-hpd-reg" title="Modbus register">' + (m.register ? escapeHtml(String(m.register)) : '—') + '</span>' +
             '<span class="ftw-hpd-val">' + escapeHtml(fmtValue(m.value, m.unit)) + '</span>' +
             '<span class="ftw-hpd-spark" data-spark-metric="' + escapeHtml(m.name) + '"></span>' +
+            '</div>' +
+            (explain ? '<div class="ftw-hpd-explain">' + escapeHtml(explain) + '</div>' : '') +
             '</div>';
         });
       });
