@@ -390,7 +390,12 @@
             // GET), but inserting any value into a `value=""` attribute
             // exposes it in the DOM/HTML. Mirror the cloud-password
             // pattern instead: empty input + saved/missing badge.
-            var saved = typeof dcfg[key] === "string" && dcfg[key] !== "";
+            // config_secrets come back masked: a non-empty value means the api
+            // sent the placeholder (e.g. api_token). For the "password" key the
+            // api blanks config.password but sets the driver-level has_password
+            // flag, so honour that too — otherwise a saved password reads as unset.
+            var saved = (typeof dcfg[key] === "string" && dcfg[key] !== "") ||
+                        (key === "password" && d.has_password === true);
             var badge = saved
               ? '<span class="creds-badge creds-saved">✓ Set — not shown here</span>'
               : '<span class="creds-badge creds-missing">⚠ Not set</span>';
