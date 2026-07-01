@@ -123,6 +123,8 @@
       '.ftw-hp-yax{display:flex;flex-direction:column;justify-content:space-between;text-align:right;min-width:26px;padding:6px 0;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:0.6rem;color:var(--fg-muted)}',
       '.ftw-hp-xax{display:flex;justify-content:space-between;margin:3px 0 0 32px;font-family:var(--mono);font-size:0.6rem;color:var(--fg-muted)}',
       '.ftw-hp-legend{display:flex;gap:14px;flex-wrap:wrap}',
+      '.ftw-hp-chartsub{font-family:var(--sans);font-size:0.72rem;color:var(--fg-muted);margin:-2px 0 6px}',
+      '.ftw-hp-asof{font-family:var(--mono);font-size:0.62rem;letter-spacing:0.04em;color:var(--fg-muted);margin:-4px 0 10px}',
       '.ftw-hp-leg{font-family:var(--mono);font-size:0.62rem;text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-muted);display:inline-flex;align-items:center;gap:4px}',
       '.ftw-hp-leg-dot{width:8px;height:8px;border-radius:2px;display:inline-block}',
       '.ftw-hp-erow{display:grid;grid-template-columns:1fr auto auto;gap:7px 18px;align-items:baseline}',
@@ -194,9 +196,10 @@
   // Multi-line SVG; line hues are fixed (read on both themes), axis chrome
   // uses theme tokens. Spans whatever history exists (fills toward a month).
   var TCHART = [
-    { key: 'outdoor', label: 'Outdoor', color: '#38bdf8' },
-    { key: 'supply',  label: 'Supply',  color: '#ef4444' },
-    { key: 'ret',     label: 'Return',  color: '#22c55e' },
+    { key: 'outdoor', label: 'Outdoor (BT1)', color: '#38bdf8' },
+    { key: 'supply',  label: 'Supply (BT2)',  color: '#ef4444' },
+    { key: 'ret',     label: 'Return (BT3)',  color: '#22c55e' },
+    { key: 'extract', label: 'Extract air (BT20)', color: '#a78bfa' },
   ];
   function tempChartBlock(temps) {
     if (!temps) return '';
@@ -234,6 +237,7 @@
     var xticks = 4, xax = '';
     for (var xi = 0; xi < xticks; xi++) { xax += '<span>' + escapeHtml(fmtDate(t0 + tspan * xi / (xticks - 1))) + '</span>'; }
     return '<div class="ftw-hp-group"><div class="ftw-hp-group-title">Temperatures (°C)</div>' +
+      '<div class="ftw-hp-chartsub">Supply / return = the heating loop (in-floor / radiators)</div>' +
       '<div class="ftw-hp-legend">' + legend + '</div>' +
       '<div class="ftw-hp-chartrow"><div class="ftw-hp-yax">' + yax + '</div>' +
       '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" class="ftw-hp-tchart" aria-hidden="true">' + grid + paths + '</svg></div>' +
@@ -241,35 +245,50 @@
       '</div>';
   }
 
-  // Compressor power over 24h as its own mini-chart (0-based kW y-axis + time
-  // x-axis). Separate from sparkline() so the ~937 tiny detail sparklines stay
-  // axis-free.
-  function powerChartBlock(points) {
-    var pts = (points || []).filter(function (p) { return p && p.v != null; });
-    if (pts.length < 2) return '';
+  // Power over 24h — Total drawn / Compressor / Internal add. heat, all in kW.
+  // Separate from sparkline() so the ~937 tiny detail sparklines stay axis-free.
+  var PCHART = [
+    { key: 'total',      label: 'Total drawn',        color: 'var(--accent-e)', scale: 1 },
+    { key: 'compressor', label: 'Compressor',         color: '#38bdf8', scale: 0.001 },
+    { key: 'internal',   label: 'Internal add. heat', color: '#f472b6', scale: 1 },
+  ];
+  function powerChartBlock(power) {
+    if (!power) return '';
+    var lines = PCHART.map(function (s) {
+      return { color: s.color, points: (power[s.key] || []).map(function (p) {
+        return { ts: p.ts, v: p.v == null ? null : p.v * s.scale };
+      }) };
+    });
+    var all = [];
+    lines.forEach(function (l) { l.points.forEach(function (p) { if (p && p.v != null) all.push(p); }); });
+    if (all.length < 2) return '';
     var w = 600, h = 90, padR = 4, padL = 2, padT = 6, padB = 6;
-    var ts = pts.map(function (p) { return p.ts; });
+    var ts = all.map(function (p) { return p.ts; });
     var t0 = Math.min.apply(null, ts), t1 = Math.max.apply(null, ts), tspan = (t1 - t0) || 1;
-    var vMax = Math.max.apply(null, pts.map(function (p) { return p.v; })) || 1;
+    var vMax = Math.max(Math.max.apply(null, all.map(function (p) { return p.v; })) || 1, 0.1);
     var vspan = vMax || 1;
     function X(t) { return (padL + (t - t0) / tspan * (w - padL - padR)).toFixed(1); }
     function Y(v) { return (padT + (1 - v / vspan) * (h - padT - padB)).toFixed(1); }
     var grid = [0, vMax / 2, vMax].map(function (v) {
       return '<line x1="' + padL + '" y1="' + Y(v) + '" x2="' + (w - padR) + '" y2="' + Y(v) + '" stroke="var(--line)" stroke-width="0.5"/>';
     }).join('');
-    var d = pts.map(function (p, i) { return (i ? 'L' : 'M') + X(p.ts) + ',' + Y(p.v); }).join(' ');
-    var area = 'M' + X(pts[0].ts) + ',' + Y(0) + ' ' +
-      pts.map(function (p) { return 'L' + X(p.ts) + ',' + Y(p.v); }).join(' ') +
-      ' L' + X(pts[pts.length - 1].ts) + ',' + Y(0) + ' Z';
-    var line = '<path d="' + area + '" fill="var(--accent-e)" fill-opacity="0.12"/>' +
-      '<path d="' + d + '" fill="none" stroke="var(--accent-e)" stroke-width="1.4" stroke-linejoin="round"/>';
-    var yax = [vMax, vMax / 2, 0].map(function (v) { return '<span>' + (v / 1000).toFixed(1) + '</span>'; }).join('');
+    var paths = lines.map(function (l) {
+      var pp = l.points.filter(function (p) { return p && p.v != null; });
+      if (pp.length < 2) return '';
+      var d = pp.map(function (p, i) { return (i ? 'L' : 'M') + X(p.ts) + ',' + Y(p.v); }).join(' ');
+      return '<path d="' + d + '" fill="none" stroke="' + l.color + '" stroke-width="1.4" stroke-linejoin="round"/>';
+    }).join('');
+    var legend = PCHART.map(function (s) {
+      return '<span class="ftw-hp-leg"><span class="ftw-hp-leg-dot" style="background:' + s.color + '"></span>' + s.label + '</span>';
+    }).join('');
+    var yax = [vMax, vMax / 2, 0].map(function (v) { return '<span>' + v.toFixed(1) + '</span>'; }).join('');
     var fmtTime = function (t) { return new Date(t).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }); };
     var xticks = 4, xax = '';
     for (var xi = 0; xi < xticks; xi++) { xax += '<span>' + escapeHtml(fmtTime(t0 + tspan * xi / (xticks - 1))) + '</span>'; }
-    return '<div class="ftw-hp-group"><div class="ftw-hp-group-title">Compressor power (kW) · 24h</div>' +
+    return '<div class="ftw-hp-group"><div class="ftw-hp-group-title">Power (kW) · 24h</div>' +
+      '<div class="ftw-hp-legend">' + legend + '</div>' +
       '<div class="ftw-hp-chartrow"><div class="ftw-hp-yax">' + yax + '</div>' +
-      '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" class="ftw-hp-pchart" aria-hidden="true">' + grid + line + '</svg></div>' +
+      '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" class="ftw-hp-pchart" aria-hidden="true">' + grid + paths + '</svg></div>' +
       '<div class="ftw-hp-xax">' + xax + '</div>' +
       '</div>';
   }
@@ -324,22 +343,30 @@
       '</div>';
   }
 
-  function renderPump(name, detail, sparkPoints, temps, energy) {
+  function renderPump(name, detail, sparkPoints, temps, energy, power) {
     var m = metricMap(detail && detail.metrics);
     var groups = GROUPS.map(function (g) {
       var tiles = g.items.map(function (def) { return tileHtml(def, m); }).join('');
       return '<div class="ftw-hp-group"><div class="ftw-hp-group-title">' + escapeHtml(g.title) + '</div>' +
         '<div class="ftw-hp-tiles">' + tiles + '</div></div>';
     }).join('');
-    var sparkBlock = powerChartBlock(sparkPoints);
+    var powerBlock = powerChartBlock(power);
+    // Freshness: newest updated_at across the reported metrics (one poll).
+    var latest = 0;
+    ((detail && detail.metrics) || []).forEach(function (x) {
+      var t = x.updated_at ? Date.parse(x.updated_at) : 0; if (t > latest) latest = t;
+    });
+    var asof = latest ? '<div class="ftw-hp-asof">data as of ' +
+      escapeHtml(new Date(latest).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })) + '</div>' : '';
     // The whole card is a button into the detail view (all signals + register).
     return '<div class="ftw-hp ftw-hp-clickable" data-hp-driver="' + escapeHtml(name) + '" role="button" tabindex="0" title="View all signals">' +
       '<div class="ftw-hp-head"><span class="ftw-hp-name">' + escapeHtml(name) + '</span>' +
       '<span class="ftw-hp-more">All signals →</span></div>' +
+      asof +
       groups +
       energyPeriodsBlock(energy) +
       tempChartBlock(temps) +
-      sparkBlock +
+      powerBlock +
       '</div>';
   }
 
@@ -384,11 +411,15 @@
           ser('hp_return_line_bt3', '30d', 400),
           ser('hp_energy_consumed_kwh', '366d', 800),
           ser('hp_energy_produced_kwh', '366d', 800),
+          ser('hp_fr_nluft_bt20', '30d', 400),
+          ser('hp_energy_log_current_power_consumption', '24h', 200),
+          ser('hp_power_internal_additional_heat', '24h', 200),
         ]).then(function (parts) {
           var pp = function (r) { return (r && r.points) || []; };
           return { name: n, detail: parts[0], series: pp(parts[1]),
-            temps: { outdoor: pp(parts[2]), supply: pp(parts[3]), ret: pp(parts[4]) },
-            energy: { consumed: pp(parts[5]), produced: pp(parts[6]) } };
+            temps: { outdoor: pp(parts[2]), supply: pp(parts[3]), ret: pp(parts[4]), extract: pp(parts[7]) },
+            energy: { consumed: pp(parts[5]), produced: pp(parts[6]) },
+            power: { compressor: pp(parts[1]), total: pp(parts[8]), internal: pp(parts[9]) } };
         });
       })).then(function (pumps) {
         var live = pumps.filter(function (p) { return p.detail && isHeatPump(p.detail); });
@@ -396,7 +427,7 @@
         injectStyles();
         section.hidden = false;
         grid.innerHTML = live.map(function (p) {
-          return renderPump(p.name, p.detail, p.series, p.temps, p.energy);
+          return renderPump(p.name, p.detail, p.series, p.temps, p.energy, p.power);
         }).join('');
       });
     });
