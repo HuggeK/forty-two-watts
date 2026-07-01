@@ -92,6 +92,7 @@ type Service struct {
 	planPath            string
 	planPublishInterval time.Duration
 	planWritten         map[string]string // uid -> content hash
+	planSeeded          bool              // reconcile map seeded from the live collection since (re)start
 	planEventCount      int
 	lastPlanMs          int64
 }

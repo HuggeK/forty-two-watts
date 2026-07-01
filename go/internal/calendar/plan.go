@@ -6,11 +6,13 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-ical"
 	webdav "github.com/emersion/go-webdav"
+	"github.com/emersion/go-webdav/caldav"
 )
 
 // PlanSlot is one MPC plan slot, supplied by the host (main.go reads it off
@@ -151,7 +153,16 @@ func (s *Service) publishPlan(ctx context.Context) {
 		return
 	}
 
-	blocks := buildPlanBlocks(src(), time.Now())
+	// If the planner has produced nothing yet (e.g. just after start, before the
+	// MPC restores or computes a plan), leave the calendar untouched. Reconciling
+	// against an empty want-set here would delete every published window — and
+	// with the seed below that would wipe the whole plan calendar on each restart.
+	slots := src()
+	if len(slots) == 0 {
+		return
+	}
+
+	blocks := buildPlanBlocks(slots, time.Now())
 	// Append the LAN-only / refresh-cadence footer to every block. Done here
 	// (not in the pure buildPlanBlocks) because it needs the live interval, and
 	// after hashing-relevant fields are set — hash() ignores the description, so
@@ -173,7 +184,36 @@ func (s *Service) publishPlan(ctx context.Context) {
 	if prev == nil {
 		prev = map[string]string{}
 	}
+	seeded := s.planSeeded
 	s.mu.Unlock()
+
+	// planWritten is in-memory and resets on restart, so on the first real
+	// reconcile after (re)start we seed it from what is actually in the plan
+	// collection. Without this, objects written before the restart whose windows
+	// have since passed are invisible to the DELETE loop and linger forever,
+	// accumulating stale past events across restarts. Seeding lets this cycle's
+	// DELETE loop reclaim them. Seeded uids not in `want` are deleted; seeded
+	// uids still wanted carry an unknown hash and are re-PUT once (harmless —
+	// a restart re-PUTs the current plan regardless).
+	if !seeded {
+		if uids, err := s.listPlanObjectUIDs(ctx); err != nil {
+			slog.Warn("caldav: could not enumerate plan collection to seed reconcile; deferring orphan cleanup", "err", err)
+		} else {
+			merged := make(map[string]string, len(prev)+len(uids))
+			for k, v := range prev {
+				merged[k] = v
+			}
+			for _, uid := range uids {
+				if _, ok := merged[uid]; !ok {
+					merged[uid] = "" // unknown hash: forces one re-PUT if still wanted, else a DELETE
+				}
+			}
+			prev = merged
+			s.mu.Lock()
+			s.planSeeded = true
+			s.mu.Unlock()
+		}
+	}
 
 	next := make(map[string]string, len(want))
 	var puts, dels int
@@ -256,6 +296,50 @@ func (s *Service) deleteObject(ctx context.Context, url, planPath, user, pass, u
 
 func planObjectPath(planPath, uid string) string {
 	return strings.TrimRight(planPath, "/") + "/" + uid + ".ics"
+}
+
+// listPlanObjectUIDs enumerates the plan collection and returns the uid of every
+// object currently in it. Used once after (re)start to seed the reconcile map so
+// orphaned objects from a previous process can be reclaimed. The uid is derived
+// from the object path (planObjectPath writes "<planPath>/<uid>.ics"), so it
+// round-trips through deleteObject without parsing the calendar body.
+func (s *Service) listPlanObjectUIDs(ctx context.Context) ([]string, error) {
+	s.mu.RLock()
+	url, planPath, user, pass := s.url, s.planPath, s.username, s.password
+	s.mu.RUnlock()
+
+	client, err := s.newClient(url, user, pass)
+	if err != nil {
+		return nil, err
+	}
+	// Wide time-range filter: plan objects are near-term, but a stale one may sit
+	// in the past, so cover a year either side to catch every orphan.
+	now := time.Now()
+	query := &caldav.CalendarQuery{
+		CompRequest: caldav.CalendarCompRequest{
+			Name:  "VCALENDAR",
+			Comps: []caldav.CalendarCompRequest{{Name: "VEVENT"}},
+		},
+		CompFilter: caldav.CompFilter{
+			Name: "VCALENDAR",
+			Comps: []caldav.CompFilter{{
+				Name:  "VEVENT",
+				Start: now.Add(-365 * 24 * time.Hour),
+				End:   now.Add(365 * 24 * time.Hour),
+			}},
+		},
+	}
+	objs, err := client.QueryCalendar(ctx, planPath, query)
+	if err != nil {
+		return nil, err
+	}
+	uids := make([]string, 0, len(objs))
+	for _, obj := range objs {
+		if uid := strings.TrimSuffix(path.Base(obj.Path), ".ics"); uid != "" && uid != "." && uid != "/" {
+			uids = append(uids, uid)
+		}
+	}
+	return uids, nil
 }
 
 // lanNote is the footer appended to every published event's description so a
